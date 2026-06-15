@@ -1,4 +1,4 @@
-# scout-boat
+# Scout-Boat
 A boat designed to help map out pollutants in laguna de bay
 
 An autonomous surface vessel engineered to analyze water conditions, manage surface waste, and provide actionable data to mitigate flooding in Taguig City and the Laguna Lake region.
