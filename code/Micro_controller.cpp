@@ -13,7 +13,8 @@
  * Packets without the E field are treated as enabled (old senders).
  */
 
-#define BOARD 2   // <-- currently: ESP32-S3 dev board
+#define BOARD 0   // <-- currently: classic ESP32 dev board
+                  //     (esptool identified the chip as plain ESP32)
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
