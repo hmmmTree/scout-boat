@@ -310,8 +310,10 @@ def main():
                 w_cmd = 90
                 winch_cmd = 90
 
+        # E:0 tells the boat to hard-stop instantly (no ramp-down)
+        en = 1 if motors_on else 0
         try:
-            sock.sendto(f"L:{left_cmd},R:{right_cmd},W:{w_cmd}".encode(),
+            sock.sendto(f"L:{left_cmd},R:{right_cmd},W:{w_cmd},E:{en}".encode(),
                         (ESP32_IP, ESP32_PORT))
         except OSError:
             pass
@@ -383,7 +385,7 @@ def main():
         clock.tick(SEND_HZ)
 
     try:
-        sock.sendto(b"L:90,R:90,W:90", (ESP32_IP, ESP32_PORT))
+        sock.sendto(b"L:90,R:90,W:90,E:0", (ESP32_IP, ESP32_PORT))
     except OSError:
         pass
     pygame.quit()

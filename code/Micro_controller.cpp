@@ -8,7 +8,9 @@
  *   XIAO   : Board "XIAO_ESP32S3", USB CDC On Boot: Enabled
  *   DevKit : Board "ESP32 Dev Module"
  *
- * Protocol: UDP text packets "L:<0-180>,R:<0-180>,W:<0-180>" to port 4210.
+ * Protocol: UDP text packets "L:<0-180>,R:<0-180>,W:<0-180>,E:<0|1>" to
+ * port 4210. E is the enable flag: E:0 = disarmed -> instant hard stop.
+ * Packets without the E field are treated as enabled (old senders).
  */
 
 #define BOARD_XIAO_S3 0   // <-- 1 = XIAO ESP32-S3, 0 = classic ESP32 dev board
@@ -59,10 +61,15 @@ unsigned long lastRampMs = 0;
 
 // ---- Failsafe ----
 unsigned long lastPacketMs = 0;
-const unsigned long FAILSAFE_MS = 750;   // hold last command 750ms, then stop
+const unsigned long FAILSAFE_MS = 300;   // no packets for 300ms -> instant stop
 bool stopped = true;
 
+// Ramp only applies to power INCREASES. Anything moving toward neutral
+// (disarm, stick release, direction change) snaps immediately - reducing
+// power is always safe and should never lag.
 int stepToward(int cur, int target, int step) {
+  if (cur > 90 && target < cur) return (target >= 90) ? target : 90;
+  if (cur < 90 && target > cur) return (target <= 90) ? target : 90;
   if (cur < target) {
     cur += step;
     if (cur > target) cur = target;
@@ -141,14 +148,21 @@ void loop() {
     int len = udp.read(packetBuf, sizeof(packetBuf) - 1);
     if (len > 0) packetBuf[len] = '\0';
 
-    int l, r, w;
-    if (sscanf(packetBuf, "L:%d,R:%d,W:%d", &l, &r, &w) == 3) {
-      targetL = constrain(l, 0, 180);
-      targetR = constrain(r, 0, 180);
-      targetW = constrain(w, 0, 180);
-
+    int l, r, w, en = 1;
+    int n = sscanf(packetBuf, "L:%d,R:%d,W:%d,E:%d", &l, &r, &w, &en);
+    if (n >= 3) {
+      if (n < 4) en = 1;               // old senders without E: = enabled
       lastPacketMs = millis();
-      stopped = false;
+
+      if (en) {
+        targetL = constrain(l, 0, 180);
+        targetR = constrain(r, 0, 180);
+        targetW = constrain(w, 0, 180);
+        stopped = false;
+      } else {
+        hardStop();                    // disarmed: everything off NOW, no ramp
+        stopped = true;
+      }
 
       // Acknowledge so the PC knows the link is alive
       udp.beginPacket(udp.remoteIP(), udp.remotePort());
@@ -168,7 +182,7 @@ void loop() {
     winch.write(curW);
   }
 
-  // ---- failsafe: after 3s of silence, snap to a stop ----
+  // ---- failsafe: link gone -> instant stop ----
   if (!stopped && (millis() - lastPacketMs > FAILSAFE_MS)) {
     hardStop();
     stopped = true;
