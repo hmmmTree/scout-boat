@@ -2,7 +2,7 @@
  * Boat control receiver — Seeed Studio XIAO ESP32-S3
  * --------------------------------------------------
  * Arduino IDE setup:
- *   Tools > Board            : "XIAO_ESP32S3"   (esp32 by Espressif, Boards Manager)
+ *   Tools > Board            : "XIAO_ESP32S3" (preferred) or "ESP32S3 Dev Module"
  *   Tools > USB CDC On Boot  : Enabled          (otherwise Serial prints go nowhere)
  *   Tools > Flash Size       : 8MB
  *
@@ -25,14 +25,15 @@ char packetBuf[64];
 
 // ---- Servos / ESCs ----
 // XIAO ESP32-S3 only breaks out GPIO 1-9 and 43/44 (silkscreened D0-D10).
-// GPIO 18/19/20 are NOT available here (19/20 are the USB D-/D+ lines), so the
-// D-pin macros below are used instead of raw GPIO numbers.
+// GPIO 18/19/20 are NOT available here (19/20 are the USB D-/D+ lines).
+// Raw GPIO numbers are used (not D-pin macros) so this compiles with either
+// "XIAO_ESP32S3" or the generic "ESP32S3 Dev Module" board selected.
 Servo leftSide;
 Servo rightSide;
 Servo winch;
-const int leftSidePin  = D1;   // GPIO2
-const int rightSidePin = D2;   // GPIO3
-const int winchPin     = D3;   // GPIO4
+const int leftSidePin  = 2;   // XIAO pad "D1"
+const int rightSidePin = 3;   // XIAO pad "D2"
+const int winchPin     = 4;   // XIAO pad "D3"
 
 // ---- Throttle ramp (anti-brownout) ----
 int targetL = 90, targetR = 90, targetW = 90;   // where we want to be (from packets)
