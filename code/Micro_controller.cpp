@@ -93,11 +93,11 @@ void setup() {
   winch.setPeriodHertz(50);
   winch.attach(winchPin);          // default pulse range (matches your test sketch)
 
-  // Arm ESCs at neutral
+  // Begin holding neutral for the ESCs; the PWM runs in hardware, so the
+  // 3s arming window can overlap with the WiFi startup below.
   hardStop();
-  delay(3000);
 
-  // Start the access point
+  // Start the access point immediately so it's visible as soon as possible
   WiFi.mode(WIFI_AP);
   WiFi.onEvent(onWiFiEvent);
   WiFi.softAP(AP_SSID, AP_PASS);
@@ -105,6 +105,9 @@ void setup() {
   // trigger on battery power. 11dBm is still plenty for a few metres of range.
   WiFi.setTxPower(WIFI_POWER_11dBm);
   WiFi.setSleep(false);            // keep UDP latency low and consistent
+
+  // Finish the ESC arming window (neutral has been held since hardStop above)
+  delay(3000);
   Serial.print("Access point started. Join WiFi network: ");
   Serial.println(AP_SSID);
   Serial.print("ESP32 IP address: ");
