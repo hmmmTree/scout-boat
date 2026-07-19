@@ -1,13 +1,17 @@
 /*
- * Boat control receiver — Seeed Studio XIAO ESP32-S3
- * --------------------------------------------------
+ * Boat control receiver — XIAO ESP32-S3 or classic ESP32 dev board
+ * ----------------------------------------------------------------
+ * Pick your board below with BOARD_XIAO_S3 (1 = Seeed XIAO ESP32-S3,
+ * 0 = normal ESP32 dev board / DevKit).
+ *
  * Arduino IDE setup:
- *   Tools > Board            : "XIAO_ESP32S3" (preferred) or "ESP32S3 Dev Module"
- *   Tools > USB CDC On Boot  : Enabled          (otherwise Serial prints go nowhere)
- *   Tools > Flash Size       : 8MB
+ *   XIAO   : Board "XIAO_ESP32S3", USB CDC On Boot: Enabled
+ *   DevKit : Board "ESP32 Dev Module"
  *
  * Protocol: UDP text packets "L:<0-180>,R:<0-180>,W:<0-180>" to port 4210.
  */
+
+#define BOARD_XIAO_S3 0   // <-- 1 = XIAO ESP32-S3, 0 = classic ESP32 dev board
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -16,29 +20,40 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ---- WiFi access point ----
-const char*    AP_SSID  = "BoatControl";
-const char*    AP_PASS  = "boat12345";   // must be at least 8 characters
-const uint16_t UDP_PORT = 4210;
+const char*    AP_SSID    = "BoatControl";
+const char*    AP_PASS    = "boat12345";   // must be at least 8 characters
+const uint16_t UDP_PORT   = 4210;
+const int      AP_CHANNEL = 6;   // move off crowded default ch1 (lots of nearby APs)
 
 WiFiUDP udp;
 char packetBuf[64];
 
 // ---- Servos / ESCs ----
-// XIAO ESP32-S3 only breaks out GPIO 1-9 and 43/44 (silkscreened D0-D10).
-// GPIO 18/19/20 are NOT available here (19/20 are the USB D-/D+ lines).
-// Raw GPIO numbers are used (not D-pin macros) so this compiles with either
-// "XIAO_ESP32S3" or the generic "ESP32S3 Dev Module" board selected.
 Servo leftSide;
 Servo rightSide;
 Servo winch;
+#if BOARD_XIAO_S3
+// XIAO only breaks out GPIO 1-9 and 43/44 (pads D0-D10); 18/19 don't exist here.
 const int leftSidePin  = 2;   // XIAO pad "D1"
 const int rightSidePin = 3;   // XIAO pad "D2"
 const int winchPin     = 4;   // XIAO pad "D3"
+#else
+// Classic ESP32 dev board. Do NOT use 2/3/4 here: GPIO3 is the serial RX pin.
+const int leftSidePin  = 18;
+const int rightSidePin = 5;
+const int winchPin     = 19;
+#endif
 
 // ---- Throttle ramp (anti-brownout) ----
+// XIAO's small regulator needs a gentle ramp; a dev board can move much faster.
+// Stick-to-full-throttle time = 90/RAMP_STEP * RAMP_INTERVAL ms.
 int targetL = 90, targetR = 90, targetW = 90;   // where we want to be (from packets)
 int curL = 90, curR = 90, curW = 90;            // where the outputs actually are
-const int RAMP_STEP = 1;                        // max change per tick (lower = gentler)
+#if BOARD_XIAO_S3
+const int RAMP_STEP = 1;                        // full throttle in ~1.8s
+#else
+const int RAMP_STEP = 4;                        // full throttle in ~0.45s
+#endif
 const unsigned long RAMP_INTERVAL = 20;         // ms between ramp ticks
 unsigned long lastRampMs = 0;
 
@@ -100,10 +115,12 @@ void setup() {
   // Start the access point immediately so it's visible as soon as possible
   WiFi.mode(WIFI_AP);
   WiFi.onEvent(onWiFiEvent);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL);
+#if BOARD_XIAO_S3
   // The XIAO's regulator is small; full 20dBm TX bursts are a common brownout
   // trigger on battery power. 11dBm is still plenty for a few metres of range.
   WiFi.setTxPower(WIFI_POWER_11dBm);
+#endif
   WiFi.setSleep(false);            // keep UDP latency low and consistent
 
   // Finish the ESC arming window (neutral has been held since hardStop above)
