@@ -1,19 +1,19 @@
 /*
- * Boat control receiver — XIAO ESP32-S3 or classic ESP32 dev board
- * ----------------------------------------------------------------
- * Pick your board below with BOARD_XIAO_S3 (1 = Seeed XIAO ESP32-S3,
- * 0 = normal ESP32 dev board / DevKit).
- *
- * Arduino IDE setup:
- *   XIAO   : Board "XIAO_ESP32S3", USB CDC On Boot: Enabled
- *   DevKit : Board "ESP32 Dev Module"
+ * Boat control receiver
+ * ---------------------
+ * Pick your board with BOARD below:
+ *   0 = classic ESP32 dev board        (Arduino board: "ESP32 Dev Module")
+ *   1 = Seeed XIAO ESP32-S3            (Arduino board: "XIAO_ESP32S3", USB CDC On Boot: Enabled)
+ *   2 = ESP32-S3 dev board / DevKitC   (Arduino board: "ESP32S3 Dev Module";
+ *                                       if flashing via the port labeled "USB",
+ *                                       set USB CDC On Boot: Enabled)
  *
  * Protocol: UDP text packets "L:<0-180>,R:<0-180>,W:<0-180>,E:<0|1>" to
  * port 4210. E is the enable flag: E:0 = disarmed -> instant hard stop.
  * Packets without the E field are treated as enabled (old senders).
  */
 
-#define BOARD_XIAO_S3 0   // <-- 1 = XIAO ESP32-S3, 0 = classic ESP32 dev board
+#define BOARD 2   // <-- currently: ESP32-S3 dev board
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -34,11 +34,18 @@ char packetBuf[64];
 Servo leftSide;
 Servo rightSide;
 Servo winch;
-#if BOARD_XIAO_S3
+#if BOARD == 1
 // XIAO only breaks out GPIO 1-9 and 43/44 (pads D0-D10); 18/19 don't exist here.
 const int leftSidePin  = 2;   // XIAO pad "D1"
 const int rightSidePin = 3;   // XIAO pad "D2"
 const int winchPin     = 4;   // XIAO pad "D3"
+#elif BOARD == 2
+// ESP32-S3 devkit: GPIO 19/20 are the USB D-/D+ lines - never use them.
+// (Also avoid strap pins 0/3/45/46.) Only the winch moves vs the classic
+// ESP32 wiring: 19 -> 4.
+const int leftSidePin  = 18;
+const int rightSidePin = 5;
+const int winchPin     = 4;
 #else
 // Classic ESP32 dev board. Do NOT use 2/3/4 here: GPIO3 is the serial RX pin.
 const int leftSidePin  = 18;
@@ -51,10 +58,10 @@ const int winchPin     = 19;
 // Stick-to-full-throttle time = 90/RAMP_STEP * RAMP_INTERVAL ms.
 int targetL = 90, targetR = 90, targetW = 90;   // where we want to be (from packets)
 int curL = 90, curR = 90, curW = 90;            // where the outputs actually are
-#if BOARD_XIAO_S3
-const int RAMP_STEP = 1;                        // full throttle in ~1.8s
+#if BOARD == 1
+const int RAMP_STEP = 1;                        // XIAO: full throttle in ~1.8s
 #else
-const int RAMP_STEP = 4;                        // full throttle in ~0.45s
+const int RAMP_STEP = 4;                        // devkits: full throttle in ~0.45s
 #endif
 const unsigned long RAMP_INTERVAL = 20;         // ms between ramp ticks
 unsigned long lastRampMs = 0;
@@ -123,7 +130,7 @@ void setup() {
   WiFi.mode(WIFI_AP);
   WiFi.onEvent(onWiFiEvent);
   WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL);
-#if BOARD_XIAO_S3
+#if BOARD == 1
   // The XIAO's regulator is small; full 20dBm TX bursts are a common brownout
   // trigger on battery power. 11dBm is still plenty for a few metres of range.
   WiFi.setTxPower(WIFI_POWER_11dBm);
