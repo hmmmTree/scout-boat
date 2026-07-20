@@ -274,9 +274,14 @@ def _net_worker(sock, net, nav):
         next_t += period
         l, r, w, en = net["cmd"]
         msg = f"L:{l},R:{r},W:{w},E:{en}".encode()
+        oneshot = net.get("oneshot")
+        if oneshot:
+            net["oneshot"] = None
 
         if ser is not None:
             try:
+                if oneshot:
+                    ser.write(oneshot.encode() + b"\n")
                 ser.write(msg + b"\n")
                 if ser.in_waiting:
                     sbuf += ser.read(ser.in_waiting)
@@ -302,6 +307,8 @@ def _net_worker(sock, net, nav):
                 net["transport"] = "WiFi"
         else:
             try:
+                if oneshot:
+                    sock.sendto(oneshot.encode(), (ESP32_IP, ESP32_PORT))
                 sock.sendto(msg, (ESP32_IP, ESP32_PORT))
             except OSError:
                 pass
@@ -386,6 +393,17 @@ class Nav:
             return False
         h, p, r = self._raw
         self.cal = {"hdg": h if h is not None else 0.0,
+                    "pitch": p if p is not None else 0.0,
+                    "roll": r if r is not None else 0.0}
+        self._save_cal()
+        return True
+
+    def zero_pitch_roll(self):
+        """Zero pitch/roll locally; heading is handled by the boat (HDGREF)."""
+        if self._raw is None:
+            return False
+        _, p, r = self._raw
+        self.cal = {"hdg": 0.0,
                     "pitch": p if p is not None else 0.0,
                     "roll": r if r is not None else 0.0}
         self._save_cal()
@@ -1281,9 +1299,9 @@ def main():
         ("I / K / O", "winch in / stop / out (driving screen)"),
         ("Arrows", "speed limit +/- (also: L1/R1 or D-pad up/down)"),
         ("C", "clear all waypoints"),
-        ("0", "zero attitude: current heading/pitch/roll become 0"),
-        ("", "  (level the boat first; bow north for true headings)"),
-        ("Shift+0", "clear the attitude calibration"),
+        ("0", "current heading becomes 000 (saved on the boat) +"),
+        ("", "  pitch/roll zeroed. Level boat; bow north for true bearings"),
+        ("Shift+0", "clear heading + attitude calibration"),
         ("H", "this panel"),
         ("F11 / ESC", "fullscreen / leave fullscreen or quit"),
         ("", ""),
@@ -1319,7 +1337,7 @@ def main():
     connected = False
 
     net = {"run": True, "cmd": (90, 90, 90, 0), "last_ack": 0.0,
-           "ack_count": 0, "transport": "WiFi"}
+           "ack_count": 0, "transport": "WiFi", "oneshot": None}
     threading.Thread(target=_net_worker, args=(sock, net, nav), daemon=True).start()
 
     def to_canvas(pos):
@@ -1389,13 +1407,22 @@ def main():
                         mapview.set_rect(MAP_RECT_NORMAL)
                 elif e.key == pygame.K_f:
                     mapview.follow = True
-                elif e.key == pygame.K_0:
+                elif e.key in (pygame.K_0, pygame.K_KP0):
+                    link_up = time.time() - net["last_ack"] < 1.0
                     if e.mod & pygame.KMOD_SHIFT:
                         nav.clear_cal()
-                        cal_toast = ("attitude calibration cleared", time.time())
+                        if link_up:
+                            net["oneshot"] = "HDGCLR"
+                        cal_toast = ("calibration cleared (boat + station)",
+                                     time.time())
+                    elif link_up and nav.zero_pitch_roll():
+                        # heading zeroed at the source, saved in boat flash
+                        net["oneshot"] = "HDGREF"
+                        cal_toast = ("heading -> 000 saved on the boat; "
+                                     "pitch/roll zeroed", time.time())
                     elif nav.zero_attitude():
-                        cal_toast = ("attitude zeroed — heading/pitch/roll "
-                                     "now relative to this pose", time.time())
+                        cal_toast = ("attitude zeroed locally (no boat link)",
+                                     time.time())
                     else:
                         cal_toast = ("no telemetry to zero", time.time())
                 elif e.key == pygame.K_w and edit_mode:
