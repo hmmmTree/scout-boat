@@ -592,7 +592,7 @@ def stick_box(surf, x, y, size, ax, ay, label):
     text(surf, "lbl", label, cx, y + size - 13, GREY, center=True)
 
 
-def compass(surf, x, y, size, heading):
+def compass(surf, x, y, size, heading, wp_bearing=None):
     panel(surf, x, y, size, size)
     cx, cy = x + size // 2, y + size // 2 + 4
     rad = size // 2 - 22
@@ -603,6 +603,17 @@ def compass(surf, x, y, size, heading):
         ty = cy + int(math.sin(a) * (rad - 11))
         text(surf, "lbl", name, tx, ty, RED if name == "N" else GREY, center=True)
     text(surf, "lbl", "COMPASS", x + size // 2, y + 11, GREY, center=True)
+    if wp_bearing is not None:
+        # next-waypoint pin: orange diamond on the rim at its bearing
+        a = math.radians(wp_bearing - 90)
+        px = cx + math.cos(a) * rad
+        py = cy + math.sin(a) * rad
+        s = 5
+        pygame.draw.polygon(surf, ORANGE,
+                            ((px, py - s), (px + s, py), (px, py + s), (px - s, py)))
+        pygame.draw.polygon(surf, BG,
+                            ((px, py - s), (px + s, py), (px, py + s), (px - s, py)),
+                            width=1)
     if heading is None:
         text(surf, "big", "--", cx, cy, DIM, center=True)
     else:
@@ -1567,6 +1578,15 @@ def main():
         age = time.time() - last_ack
         w_btns = []
 
+        # bearing/distance to the next waypoint (AUTO target, else WP1)
+        wp_bear = wp_dist = None
+        tgt_i = mission["idx"] if mode == "AUTO" else 0
+        if (mapview.waypoints and tgt_i < len(mapview.waypoints)
+                and nav.alive and nav.has_fix):
+            _wpt = mapview.waypoints[tgt_i]
+            wp_dist, wp_bear = geo_dist_bearing(nav.lat, nav.lon,
+                                                _wpt["lat"], _wpt["lon"])
+
         if not edit_mode:
             # -- left column: drive --
             pill(canvas, 24, 96, 208, 42, "CONTROLLER", connected,
@@ -1587,7 +1607,8 @@ def main():
             stick_box(canvas, 232, 474, 126, rx, ry, "R STICK")
             compass(canvas, 366, 338, 82,
                     None if not (nav.alive and nav.heading is not None)
-                    else nav.heading)
+                    else nav.heading,
+                    wp_bear)
             panel(canvas, 366, 428, 82, 172)
             text(canvas, "lbl", "OUT", 380, 440, GREY)
             text(canvas, "sm", f"L {pct(left_cmd):+d}", 380, 462, WHITE)
@@ -1697,6 +1718,12 @@ def main():
             tile(canvas, 676, t_y, 196, 78, "HEADING",
                  f"{int(hdg) % 360:03d}°" if hdg is not None else "--",
                  "", CYAN if hdg is not None else DIM)
+            if wp_bear is not None:
+                d_txt = (f"{wp_dist:.0f}m" if wp_dist < 1000
+                         else f"{wp_dist/1000:.1f}km")
+                text(canvas, "lbl",
+                     f"WP{tgt_i+1} {int(wp_bear):03d}° {d_txt}",
+                     676 + 100, t_y + 12, ORANGE)
             panel(canvas, 880, t_y, 202, 78)
             text(canvas, "lbl", "POSITION", 894, t_y + 10, GREY)
             if nav.alive and nav.has_fix:
