@@ -3,8 +3,9 @@
 Keys / controls:
   F11        fullscreen toggle          SPACE / Square   arm-disarm
   Arrows or L1/R1  speed limit          ESC              exit fullscreen / quit
-  TRI/O/X    winch in/stop/out          M                AUTO <-> TELEOP
-  E          EDIT MODE (keyboard only)  F                re-follow boat on map
+  I / K / O  winch in/stop/out          M / Options      AUTO <-> TELEOP
+  R2/L2 hold winch in/out (momentary)   H                controls reference
+  E          EDIT MODE (keyboard only)  F / Share        re-follow boat on map
   Map (always): drag = pan, scroll = zoom.  OSM tiles cache to assets/tiles
   and work offline once downloaded (Philippines overview pre-cached).
   EDIT MODE only: click = add/select waypoint, drag one = move it,
@@ -121,13 +122,18 @@ def _pc_locator():
 
 AXIS_LY = 1
 AXIS_RX = 2
+AXIS_L2 = 4            # analog triggers: rest = -1, pressed = +1
+AXIS_R2 = 5
 BTN_CROSS    = 0
 BTN_CIRCLE   = 1
 BTN_SQUARE   = 2
 BTN_TRIANGLE = 3
+BTN_SHARE    = 4
+BTN_OPTIONS  = 6
 BTN_L1       = 9
 BTN_R1       = 10
 DEADZONE = 0.15
+TRIGGER_ON = 0.25      # trigger travel (0..1) that counts as pressed
 TIMEOUT = 3
 
 # virtual canvas — everything is drawn at this size, then scaled to the window
@@ -693,6 +699,9 @@ class MapView:
         if z is not None:
             self.z = z
 
+    def set_rect(self, rect):
+        self.rect = pygame.Rect(rect)
+
     # ---- drawing ----
     def draw(self, surf, nav, target_idx=None, edit=False):
         r = self.rect
@@ -1045,11 +1054,16 @@ def main():
     boat3d = Boat3D((1098, 400, 478, 330))
     cam_rect = (1098, 96, 478, 292)
 
+    MAP_RECT_NORMAL = (472, 96, 610, 580)
+    MAP_RECT_EDIT = (24, 72, W - 48, H - 160)
+
     js = None
     speed = 1.0
     motors_on = False              # SAFETY: always start disarmed
     mode = "TELEOP"                # "TELEOP" | "AUTO"
     edit_mode = False              # keyboard E only — mission editing
+    help_open = False
+    help_scroll = 0
     wp_index = 0
     hold_until = 0.0
     auto_info = ""
@@ -1057,6 +1071,44 @@ def main():
     w_cmd = 90
     left_cmd = right_cmd = 90
     prev_square = prev_l1 = prev_r1 = False
+    prev_options = prev_share = False
+    prev_hat_y = 0
+    w_btns = []                    # on-screen winch buttons: (Rect, cmd)
+
+    HELP_LINES = [
+        ("KEYBOARD", ""),
+        ("SPACE", "arm / disarm (also: Square)"),
+        ("M", "AUTO <-> TELEOP (also: Options)"),
+        ("E", "edit mode: full-screen map, motors disabled"),
+        ("F", "map follows the boat again (also: Share)"),
+        ("I / K / O", "winch in / stop / out (also on-screen buttons)"),
+        ("Arrows", "speed limit +/- (also: L1/R1 or D-pad up/down)"),
+        ("C", "clear all waypoints"),
+        ("H", "this panel"),
+        ("F11 / ESC", "fullscreen / leave fullscreen or quit"),
+        ("", ""),
+        ("EDIT MODE (keyboard E)", ""),
+        ("click", "add waypoint / select one"),
+        ("drag waypoint", "move it"),
+        ("right-click / DEL", "delete waypoint / delete selected"),
+        ("[ / ]", "selected waypoint hold time -/+5s"),
+        ("Ctrl+Z", "undo any mission edit"),
+        ("", ""),
+        ("CONTROLLER (DS4)", ""),
+        ("Left stick Y", "throttle"),
+        ("Right stick X", "steer"),
+        ("R2 / L2 (hold)", "winch in / out — releases to stop"),
+        ("Triangle / Circle / Cross", "winch latched in / stop / out"),
+        ("Square", "arm / disarm"),
+        ("Options", "AUTO <-> TELEOP"),
+        ("Share", "map re-follows boat"),
+        ("L1 / R1, D-pad", "speed limit -/+"),
+        ("", ""),
+        ("MAP", ""),
+        ("drag / scroll", "pan / zoom (zoom keeps cursor position)"),
+        ("purple PC pin", "this computer (IP location, city precision)"),
+        ("offline tiles", "python download_map.py  (run at home)"),
+    ]
     disconnect_time = 0.0
     cam_decoded = None
     cam_last_decode = 0.0
@@ -1104,27 +1156,41 @@ def main():
                         (0, 0) if fullscreen else (WIN_W, WIN_H),
                         pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE)
                 elif e.key == pygame.K_ESCAPE:
-                    if fullscreen:
+                    if help_open:
+                        help_open = False
+                    elif fullscreen:
                         fullscreen = False
                         screen = pygame.display.set_mode((WIN_W, WIN_H), pygame.RESIZABLE)
                     else:
                         running = False
+                elif e.key == pygame.K_h:
+                    help_open = not help_open
+                    help_scroll = 0
                 elif e.key in (pygame.K_UP, pygame.K_RIGHT):
                     speed = clamp(round(speed + 0.1, 1), 0.0, 2.0)
                 elif e.key in (pygame.K_DOWN, pygame.K_LEFT):
                     speed = clamp(round(speed - 0.1, 1), 0.0, 2.0)
-                elif e.key == pygame.K_SPACE:
+                elif e.key == pygame.K_SPACE and not edit_mode:
                     motors_on = not motors_on
                 elif e.key == pygame.K_m:
                     toggle_mode()
                 elif e.key == pygame.K_e:
                     edit_mode = not edit_mode
-                    if edit_mode and mode == "AUTO":
-                        mode = "TELEOP"       # editing and AUTO don't mix
-                    if not edit_mode:
+                    if edit_mode:
+                        mode = "TELEOP"       # editing disables everything
+                        motors_on = False
+                        mapview.set_rect(MAP_RECT_EDIT)
+                    else:
                         mapview.sel = None
+                        mapview.set_rect(MAP_RECT_NORMAL)
                 elif e.key == pygame.K_f:
                     mapview.follow = True
+                elif e.key == pygame.K_i and not edit_mode:
+                    winch_cmd = 180
+                elif e.key == pygame.K_k and not edit_mode:
+                    winch_cmd = 90
+                elif e.key == pygame.K_o and not edit_mode:
+                    winch_cmd = 0
                 elif e.key == pygame.K_c:
                     mapview.clear_all()
                     mode = "TELEOP"
@@ -1138,11 +1204,21 @@ def main():
                     mapview.undo()
             elif e.type == pygame.MOUSEBUTTONDOWN:
                 cpos = to_canvas(e.pos)
-                if e.button in (4, 5):
+                if help_open:
+                    if e.button == 4:
+                        help_scroll = max(0, help_scroll - 3)
+                    elif e.button == 5:
+                        help_scroll += 3
+                    elif e.button == 1:
+                        help_open = False
+                elif e.button in (4, 5):
                     if mapview.rect.collidepoint(cpos):
                         mapview.zoom_at(cpos, 1 if e.button == 4 else -1)
-                elif e.button == 1 and boat3d.mouse_down(cpos):
+                elif e.button == 1 and not edit_mode and boat3d.mouse_down(cpos):
                     pass
+                elif e.button == 1 and next(
+                        (True for r, _ in w_btns if r.collidepoint(cpos)), False):
+                    winch_cmd = next(c for r, c in w_btns if r.collidepoint(cpos))
                 elif btn_start.collidepoint(cpos):
                     toggle_mode()
                 elif btn_clear.collidepoint(cpos):
@@ -1155,11 +1231,14 @@ def main():
                 mapview.mouse_up(to_canvas(e.pos), edit_mode)
             elif e.type == pygame.MOUSEMOTION:
                 cpos = to_canvas(e.pos)
-                boat3d.mouse_move(cpos)
+                if not edit_mode:
+                    boat3d.mouse_move(cpos)
                 mapview.mouse_move(cpos)
             elif e.type == pygame.MOUSEWHEEL:
                 cpos = to_canvas(pygame.mouse.get_pos())
-                if mapview.rect.collidepoint(cpos):
+                if help_open:
+                    help_scroll = max(0, help_scroll - e.y * 3)
+                elif mapview.rect.collidepoint(cpos):
                     mapview.zoom_at(cpos, e.y)
 
         try:
@@ -1189,10 +1268,18 @@ def main():
             triangle = safe_button(js, BTN_TRIANGLE)
             circle   = safe_button(js, BTN_CIRCLE)
             cross    = safe_button(js, BTN_CROSS)
+            options  = safe_button(js, BTN_OPTIONS)
+            share    = safe_button(js, BTN_SHARE)
 
-            if square and not prev_square:
+            if square and not prev_square and not edit_mode:
                 motors_on = not motors_on
             prev_square = square
+            if options and not prev_options:
+                toggle_mode()
+            prev_options = options
+            if share and not prev_share:
+                mapview.follow = True
+            prev_share = share
 
             l1 = safe_button(js, BTN_L1)
             r1 = safe_button(js, BTN_R1)
@@ -1203,6 +1290,17 @@ def main():
             prev_r1 = r1
             prev_l1 = l1
 
+            # D-pad up/down also steps the speed limit
+            try:
+                hat_y = js.get_hat(0)[1] if js.get_numhats() > 0 else 0
+            except Exception:
+                hat_y = 0
+            if hat_y == 1 and prev_hat_y != 1:
+                speed = clamp(round(speed + 0.1, 1), 0.0, 2.0)
+            elif hat_y == -1 and prev_hat_y != -1:
+                speed = clamp(round(speed - 0.1, 1), 0.0, 2.0)
+            prev_hat_y = hat_y
+
             if triangle:
                 winch_cmd = 180
             elif circle:
@@ -1210,13 +1308,23 @@ def main():
             elif cross:
                 winch_cmd = 0
 
+            # analog triggers: hold-to-run winch, releases back to latched cmd
+            l2 = (safe_axis(js, AXIS_L2) + 1.0) / 2.0
+            r2 = (safe_axis(js, AXIS_R2) + 1.0) / 2.0
+            if r2 > TRIGGER_ON:
+                winch_live = 180
+            elif l2 > TRIGGER_ON:
+                winch_live = 0
+            else:
+                winch_live = None
+
             if motors_on:
                 lp = clamp(forward + turn, -1.0, 1.0)
                 rp = clamp(forward - turn, -1.0, 1.0)
                 rng = 90 * speed
                 left_cmd  = int(clamp(90 + lp * rng, 0, 180))
                 right_cmd = int(clamp(90 + rp * rng, 0, 180))
-                w_cmd = winch_cmd
+                w_cmd = winch_live if winch_live is not None else winch_cmd
             else:
                 left_cmd = right_cmd = 90
                 w_cmd = 90
@@ -1239,12 +1347,9 @@ def main():
                         mode = "TELEOP"
         else:
             left_cmd = right_cmd = 90
-            mode = "TELEOP"               # controller is the deadman switch
-            if time.time() - disconnect_time < TIMEOUT:
-                w_cmd = winch_cmd
-            else:
-                w_cmd = 90
-                winch_cmd = 90
+            mode = "TELEOP"               # controller is the deadman for AUTO
+            # keyboard / on-screen winch still works while armed
+            w_cmd = winch_cmd if motors_on else 90
 
         # hand the command to the 50Hz network thread (E:0 = instant stop)
         net["cmd"] = (left_cmd, right_cmd, w_cmd, 1 if motors_on else 0)
@@ -1276,50 +1381,69 @@ def main():
         ssid = current_ssid[0]
         on_boat_wifi = (ssid == BOAT_SSID)
         wifi_detail = ssid if len(ssid) <= 14 else ssid[:13] + "…"
-
-        # -- left column: drive --
-        pill(canvas, 24, 96, 208, 42, "CONTROLLER", connected,
-             "OK" if connected else "NOT FOUND")
-        pill(canvas, 240, 96, 208, 42, "WIFI", on_boat_wifi, wifi_detail)
         age = time.time() - last_ack
-        pill(canvas, 24, 146, 208, 42, "BOAT LINK", boat_ok,
-             f"OK {int(age*1000)}ms" if boat_ok else "LOST")
-        pill(canvas, 240, 146, 208, 42, "GPS",
-             nav.alive and nav.has_fix,
-             f"{nav.sats} SATS" if (nav.alive and nav.has_fix) else "NO FIX")
+        w_btns = []
 
-        arm_banner(canvas, 24, 200, 424, 62, motors_on)
-        speed_bar(canvas, 24, 270, 424, 56, speed)
+        if not edit_mode:
+            # -- left column: drive --
+            pill(canvas, 24, 96, 208, 42, "CONTROLLER", connected,
+                 "OK" if connected else "NOT FOUND")
+            pill(canvas, 240, 96, 208, 42, "WIFI", on_boat_wifi, wifi_detail)
+            pill(canvas, 24, 146, 208, 42, "BOAT LINK", boat_ok,
+                 f"OK {int(age*1000)}ms" if boat_ok else "LOST")
+            pill(canvas, 240, 146, 208, 42, "GPS",
+                 nav.alive and nav.has_fix,
+                 f"{nav.sats} SATS" if (nav.alive and nav.has_fix) else "NO FIX")
 
-        motor_bar(canvas, 24, 338, 96, 262, left_cmd, "LEFT", motors_on)
-        motor_bar(canvas, 128, 338, 96, 262, right_cmd, "RIGHT", motors_on)
-        stick_box(canvas, 232, 338, 126, lx, ly, "L STICK")
-        stick_box(canvas, 232, 474, 126, rx, ry, "R STICK")
-        compass(canvas, 366, 338, 82, None if not (nav.alive and nav.heading is not None)
-                else nav.heading)
-        panel(canvas, 366, 428, 82, 172)
-        text(canvas, "lbl", "OUT", 380, 440, GREY)
-        text(canvas, "sm", f"L {pct(left_cmd):+d}", 380, 462, WHITE)
-        text(canvas, "sm", f"R {pct(right_cmd):+d}", 380, 484, WHITE)
-        text(canvas, "sm", f"W {pct(w_cmd):+d}", 380, 506, WHITE)
-        text(canvas, "sm", f"ack", 380, 540, DIM)
-        text(canvas, "sm", f"{ack_count}", 380, 560, GREY)
+            arm_banner(canvas, 24, 200, 424, 62, motors_on)
+            speed_bar(canvas, 24, 270, 424, 56, speed)
 
-        winch_ind(canvas, 24, 608, 424, 44, w_cmd)
+            motor_bar(canvas, 24, 338, 96, 262, left_cmd, "LEFT", motors_on)
+            motor_bar(canvas, 128, 338, 96, 262, right_cmd, "RIGHT", motors_on)
+            stick_box(canvas, 232, 338, 126, lx, ly, "L STICK")
+            stick_box(canvas, 232, 474, 126, rx, ry, "R STICK")
+            compass(canvas, 366, 338, 82,
+                    None if not (nav.alive and nav.heading is not None)
+                    else nav.heading)
+            panel(canvas, 366, 428, 82, 172)
+            text(canvas, "lbl", "OUT", 380, 440, GREY)
+            text(canvas, "sm", f"L {pct(left_cmd):+d}", 380, 462, WHITE)
+            text(canvas, "sm", f"R {pct(right_cmd):+d}", 380, 484, WHITE)
+            text(canvas, "sm", f"W {pct(w_cmd):+d}", 380, 506, WHITE)
+            text(canvas, "sm", f"ack", 380, 540, DIM)
+            text(canvas, "sm", f"{ack_count}", 380, 560, GREY)
 
-        if not on_boat_wifi:
-            text(canvas, "sm",
-                 f'Join WiFi "{BOAT_SSID}" — "No internet" there is normal.',
-                 24, 664, ORANGE)
-        elif not boat_ok:
-            text(canvas, "sm", "On boat WiFi but no reply — boat powered?",
-                 24, 664, ORANGE)
+            # winch: state + clickable actuation buttons (keys I/K/O)
+            panel(canvas, 24, 608, 424, 44)
+            state = ("IN ^" if w_cmd > 100 else
+                     ("OUT v" if w_cmd < 80 else "STOP"))
+            scol = (GREEN if w_cmd > 100 else
+                    (ORANGE if w_cmd < 80 else GREY))
+            text(canvas, "lbl", "WINCH", 36, 608 + 8, GREY)
+            text(canvas, "med", state, 36, 608 + 22, scol)
+            w_btns = [
+                (button(canvas, (208, 614, 72, 32), "IN (I)",
+                        accent=GREEN if winch_cmd == 180 else BLUE), 180),
+                (button(canvas, (286, 614, 72, 32), "STOP(K)",
+                        accent=WHITE if winch_cmd == 90 else BLUE), 90),
+                (button(canvas, (364, 614, 72, 32), "OUT (O)",
+                        accent=ORANGE if winch_cmd == 0 else BLUE), 0),
+            ]
 
-        # -- middle column: navigation --
+            if not on_boat_wifi:
+                text(canvas, "sm",
+                     f'Join WiFi "{BOAT_SSID}" — "No internet" there is normal.',
+                     24, 664, ORANGE)
+            elif not boat_ok:
+                text(canvas, "sm", "On boat WiFi but no reply — boat powered?",
+                     24, 664, ORANGE)
+
+        # -- navigation map (full-screen in edit mode) --
         # first successful geolocation: recenter an untouched overview map
         if pc_loc[0] and not mapview.touched and mapview.z <= 6 and not nav.has_fix:
             mapview.center_on(pc_loc[0]["lat"], pc_loc[0]["lon"], 12)
-        text(canvas, "lbl", "NAVIGATION", 472, 74, GREY)
+        if not edit_mode:
+            text(canvas, "lbl", "NAVIGATION", 472, 74, GREY)
         mapview.draw(canvas, nav,
                      wp_index if mode == "AUTO" and wp_index < len(mapview.waypoints)
                      else None,
@@ -1328,67 +1452,114 @@ def main():
             text(canvas, "med", "AUTO", mapview.rect.right - 46,
                  mapview.rect.top + 20, ORANGE, center=True)
 
-        bar_y = 96 + 580 + 8
-        panel(canvas, 472, bar_y, 610, 44)
+        # mission bar: under the map normally, full width in edit mode
+        if edit_mode:
+            bar_x, bar_y, bar_w = 24, H - 76, W - 48
+        else:
+            bar_x, bar_y, bar_w = 472, 96 + 580 + 8, 610
+        panel(canvas, bar_x, bar_y, bar_w, 44)
         wp_n = len(mapview.waypoints)
         in_auto = (mode == "AUTO")
-        # mode chip
-        pygame.draw.rect(canvas, PANEL2, (482, bar_y + 6, 118, 32), border_radius=8)
+        pygame.draw.rect(canvas, PANEL2, (bar_x + 10, bar_y + 6, 118, 32),
+                         border_radius=8)
         chip = "EDIT" if edit_mode else mode
-        text(canvas, "med", chip, 482 + 59, bar_y + 22,
+        text(canvas, "med", chip, bar_x + 69, bar_y + 22,
              CYAN if edit_mode else (ORANGE if in_auto else BLUE), center=True)
-        text(canvas, "med", f"WP: {wp_n}", 616, bar_y + 13, WHITE)
-        btn_start = button(canvas, (688, bar_y + 6, 156, 32),
+        text(canvas, "med", f"WP: {wp_n}", bar_x + 144, bar_y + 13, WHITE)
+        btn_start = button(canvas, (bar_x + 216, bar_y + 6, 156, 32),
                            "STOP AUTO (M)" if in_auto else "START AUTO (M)",
                            enabled=in_auto or auto_ready(),
                            accent=RED if in_auto else GREEN)
-        btn_clear = button(canvas, (854, bar_y + 6, 100, 32), "CLEAR (C)")
-        if in_auto:
-            text(canvas, "lbl", auto_info, 966, bar_y + 17, ORANGE)
+        btn_clear = button(canvas, (bar_x + 382, bar_y + 6, 100, 32), "CLEAR (C)")
+        if edit_mode:
+            text(canvas, "sm",
+                 "click add/select   drag move   r-click/DEL delete   "
+                 "[ ] hold ±5s   Ctrl+Z undo   E exit   H help",
+                 bar_x + 500, bar_y + 14, GREY)
+        elif in_auto:
+            text(canvas, "lbl", auto_info, bar_x + 494, bar_y + 17, ORANGE)
         elif not auto_ready():
             need = "needs: "
-            if edit_mode: need += "exit EDIT (E) "
             if not motors_on: need += "ARM "
             if not connected: need += "controller "
             if not (nav.alive and nav.has_fix): need += "GPS "
             elif nav.heading is None: need += "heading "
             if not wp_n: need += "waypoints"
-            text(canvas, "lbl", need.strip(), 966, bar_y + 17, DIM)
+            text(canvas, "lbl", need.strip(), bar_x + 494, bar_y + 17, DIM)
 
-        # tiles under mission bar: SPEED / HEADING / POSITION
-        t_y = bar_y + 52
-        spd = nav.speed if (nav.alive and nav.speed is not None and nav.has_fix) else None
-        tile(canvas, 472, t_y, 196, 78, "SPEED (GPS)",
-             f"{spd:.1f}" if spd is not None else "--",
-             "m/s" if spd is not None else "", CYAN if spd is not None else DIM)
-        hdg = nav.heading if (nav.alive and nav.heading is not None) else None
-        tile(canvas, 676, t_y, 196, 78, "HEADING",
-             f"{int(hdg) % 360:03d}°" if hdg is not None else "--",
-             "", CYAN if hdg is not None else DIM)
-        panel(canvas, 880, t_y, 202, 78)
-        text(canvas, "lbl", "POSITION", 894, t_y + 10, GREY)
-        if nav.alive and nav.has_fix:
-            text(canvas, "sm", f"{nav.lat:+.6f}", 894, t_y + 30, WHITE)
-            text(canvas, "sm", f"{nav.lon:+.6f}", 894, t_y + 50, WHITE)
-        else:
-            text(canvas, "med", "--", 894, t_y + 36, DIM)
+        if not edit_mode:
+            # tiles under mission bar: SPEED / HEADING / POSITION
+            t_y = bar_y + 52
+            spd = nav.speed if (nav.alive and nav.speed is not None and nav.has_fix) else None
+            tile(canvas, 472, t_y, 196, 78, "SPEED (GPS)",
+                 f"{spd:.1f}" if spd is not None else "--",
+                 "m/s" if spd is not None else "", CYAN if spd is not None else DIM)
+            hdg = nav.heading if (nav.alive and nav.heading is not None) else None
+            tile(canvas, 676, t_y, 196, 78, "HEADING",
+                 f"{int(hdg) % 360:03d}°" if hdg is not None else "--",
+                 "", CYAN if hdg is not None else DIM)
+            panel(canvas, 880, t_y, 202, 78)
+            text(canvas, "lbl", "POSITION", 894, t_y + 10, GREY)
+            if nav.alive and nav.has_fix:
+                text(canvas, "sm", f"{nav.lat:+.6f}", 894, t_y + 30, WHITE)
+                text(canvas, "sm", f"{nav.lon:+.6f}", 894, t_y + 50, WHITE)
+            else:
+                text(canvas, "med", "--", 894, t_y + 36, DIM)
 
-        # -- right column: camera + 3D --
-        text(canvas, "lbl", "CAMERA / MODEL", 1098, 74, GREY)
-        draw_camera(canvas, cam_rect, cam_decoded)
-        boat3d.draw(canvas, nav, dt)
+            # -- right column: camera + 3D --
+            text(canvas, "lbl", "CAMERA / MODEL", 1098, 74, GREY)
+            draw_camera(canvas, cam_rect, cam_decoded)
+            boat3d.draw(canvas, nav, dt)
 
-        panel(canvas, 1098, 738, 478, 62)
-        text(canvas, "lbl", "SENSORS", 1112, 748, GREY)
-        text(canvas, "sm",
-             "GPS: u-blox M10   IMU: 9-axis   CAM: XIAO S3 Sense",
-             1112, 768, GREY)
+            panel(canvas, 1098, 738, 478, 62)
+            text(canvas, "lbl", "SENSORS", 1112, 748, GREY)
+            text(canvas, "sm",
+                 "GPS: u-blox M10   IMU: 9-axis   CAM: XIAO S3 Sense",
+                 1112, 768, GREY)
 
-        text(canvas, "sm",
-             "SPACE arm   M auto/teleop (sticks override)   E edit mode   "
-             "F follow boat   edit: click add/select, drag move, r-click del, "
-             "[ ] hold time, DEL delete, Ctrl+Z undo   F11",
-             24, H - 26, GREY)
+            text(canvas, "sm",
+                 "H = all controls    SPACE arm    M auto/teleop    "
+                 "E edit mode    I/K/O winch    F11 fullscreen",
+                 24, H - 26, GREY)
+
+        # -- help overlay (H): scrollable controls reference --
+        if help_open:
+            shade = pygame.Surface((W, H), pygame.SRCALPHA)
+            shade.fill((0, 0, 0, 150))
+            canvas.blit(shade, (0, 0))
+            hw, hh = 640, 560
+            hx, hy = (W - hw) // 2, (H - hh) // 2
+            panel(canvas, hx, hy, hw, hh, PANEL)
+            text(canvas, "big", "CONTROLS", hx + 24, hy + 16, WHITE)
+            text(canvas, "lbl", "scroll to browse — H or ESC to close",
+                 hx + hw - 250, hy + 26, GREY)
+            row_h = 24
+            view_rows = (hh - 70) // row_h
+            max_scroll = max(0, len(HELP_LINES) - view_rows)
+            help_scroll = clamp(help_scroll, 0, max_scroll)
+            clip_prev = canvas.get_clip()
+            canvas.set_clip((hx, hy + 56, hw, hh - 70))
+            for r_i, (k, desc) in enumerate(
+                    HELP_LINES[help_scroll:help_scroll + view_rows + 1]):
+                yy = hy + 60 + r_i * row_h
+                if desc == "" and k:
+                    text(canvas, "med", k, hx + 24, yy, CYAN)
+                else:
+                    text(canvas, "sm", k, hx + 40, yy, YELLOW)
+                    text(canvas, "sm", desc, hx + 240, yy, WHITE)
+            canvas.set_clip(clip_prev)
+            # scroll bar
+            if max_scroll > 0:
+                track_h = hh - 80
+                thumb_h = max(30, int(track_h * view_rows / len(HELP_LINES)))
+                thumb_y = hy + 60 + int((track_h - thumb_h)
+                                        * help_scroll / max_scroll)
+                pygame.draw.rect(canvas, PANEL2,
+                                 (hx + hw - 14, hy + 60, 6, track_h),
+                                 border_radius=3)
+                pygame.draw.rect(canvas, GREY,
+                                 (hx + hw - 14, thumb_y, 6, thumb_h),
+                                 border_radius=3)
 
         # ---- letterbox scale to window ----
         win_w, win_h = screen.get_size()
