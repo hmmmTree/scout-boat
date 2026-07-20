@@ -827,7 +827,7 @@ def main():
 
         # tiles under mission bar: SPEED / HEADING / POSITION
         t_y = bar_y + 52
-        spd = nav.speed if (nav.alive and nav.speed is not None) else None
+        spd = nav.speed if (nav.alive and nav.speed is not None and nav.has_fix) else None
         tile(canvas, 472, t_y, 196, 78, "SPEED (GPS)",
              f"{spd:.1f}" if spd is not None else "--",
              "m/s" if spd is not None else "", CYAN if spd is not None else DIM)
