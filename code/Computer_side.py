@@ -350,6 +350,8 @@ def _net_worker(sock, net, nav):
 
 # ---- GPS / IMU state (filled by T: telemetry from the boat) ----
 class Nav:
+    CAL_FILE = "attitude_cal.json"
+
     def __init__(self):
         self.has_fix = False
         self.lat = self.lon = 0.0
@@ -362,6 +364,43 @@ class Nav:
         self.last_update = 0.0
         # feed() runs on the network thread, drawing on the GUI thread
         self._lock = threading.Lock()
+        # attitude zero calibration: raw values captured when the user
+        # pressed 0 with the boat level / bow on the reference direction
+        self._raw = None             # (heading, pitch, roll) last raw
+        self.cal = {"hdg": 0.0, "pitch": 0.0, "roll": 0.0}
+        try:
+            c = json.load(open(os.path.join(ASSET_DIR, self.CAL_FILE)))
+            self.cal = {"hdg": float(c.get("hdg", 0)),
+                        "pitch": float(c.get("pitch", 0)),
+                        "roll": float(c.get("roll", 0))}
+        except Exception:
+            pass
+
+    @property
+    def cal_active(self):
+        return any(abs(v) > 0.05 for v in self.cal.values())
+
+    def zero_attitude(self):
+        """Capture current raw attitude as the new zero. True if it took."""
+        if self._raw is None:
+            return False
+        h, p, r = self._raw
+        self.cal = {"hdg": h if h is not None else 0.0,
+                    "pitch": p if p is not None else 0.0,
+                    "roll": r if r is not None else 0.0}
+        self._save_cal()
+        return True
+
+    def clear_cal(self):
+        self.cal = {"hdg": 0.0, "pitch": 0.0, "roll": 0.0}
+        self._save_cal()
+
+    def _save_cal(self):
+        try:
+            os.makedirs(ASSET_DIR, exist_ok=True)
+            json.dump(self.cal, open(os.path.join(ASSET_DIR, self.CAL_FILE), "w"))
+        except Exception:
+            pass
 
     def trail_points(self):
         with self._lock:
@@ -369,6 +408,13 @@ class Nav:
 
     def feed(self, lat, lon, heading, sats, speed=None, pitch=None, roll=None):
         self.lat, self.lon, self.sats = lat, lon, sats
+        self._raw = (heading, pitch, roll)
+        if heading is not None:
+            heading = (heading - self.cal["hdg"]) % 360.0
+        if pitch is not None:
+            pitch = pitch - self.cal["pitch"]
+        if roll is not None:
+            roll = roll - self.cal["roll"]
         self.heading = heading
         self.speed = speed
         self.pitch, self.roll = pitch, roll
@@ -1090,6 +1136,8 @@ class Boat3D:
         else:
             text(surf, "lbl", "NO TELEMETRY — model at rest",
                  r.x + 12, r.bottom - 24, DIM)
+        if nav.cal_active:
+            text(surf, "lbl", "CAL", r.right - 40, r.y + 10, YELLOW)
 
     def _render(self, w, h, yaw, pitch, roll):
         out = pygame.Surface((w, h), pygame.SRCALPHA)
@@ -1213,6 +1261,7 @@ def main():
     edit_mode = False              # keyboard E only — mission editing
     help_open = False
     help_scroll = 0
+    cal_toast = ("", 0.0)
     mission = {"idx": 0, "phase": "transit", "until": 0.0}
     auto_info = ""
     winch_cmd = 90
@@ -1232,6 +1281,9 @@ def main():
         ("I / K / O", "winch in / stop / out (driving screen)"),
         ("Arrows", "speed limit +/- (also: L1/R1 or D-pad up/down)"),
         ("C", "clear all waypoints"),
+        ("0", "zero attitude: current heading/pitch/roll become 0"),
+        ("", "  (level the boat first; bow north for true headings)"),
+        ("Shift+0", "clear the attitude calibration"),
         ("H", "this panel"),
         ("F11 / ESC", "fullscreen / leave fullscreen or quit"),
         ("", ""),
@@ -1337,6 +1389,15 @@ def main():
                         mapview.set_rect(MAP_RECT_NORMAL)
                 elif e.key == pygame.K_f:
                     mapview.follow = True
+                elif e.key == pygame.K_0:
+                    if e.mod & pygame.KMOD_SHIFT:
+                        nav.clear_cal()
+                        cal_toast = ("attitude calibration cleared", time.time())
+                    elif nav.zero_attitude():
+                        cal_toast = ("attitude zeroed — heading/pitch/roll "
+                                     "now relative to this pose", time.time())
+                    else:
+                        cal_toast = ("no telemetry to zero", time.time())
                 elif e.key == pygame.K_w and edit_mode:
                     mapview.cycle_winch()
                 elif e.key == pygame.K_MINUS and edit_mode:
@@ -1724,6 +1785,10 @@ def main():
                  "H = all controls    SPACE arm    M auto/teleop    "
                  "E edit mode    I/K/O winch    F11 fullscreen",
                  24, H - 26, GREY)
+
+        # calibration toast (0 / Shift+0)
+        if time.time() - cal_toast[1] < 3.0 and cal_toast[0]:
+            text(canvas, "med", cal_toast[0], W // 2, H - 56, YELLOW, center=True)
 
         # -- help overlay (H): scrollable controls reference --
         if help_open:
