@@ -1368,6 +1368,7 @@ def main():
         ("MAP", ""),
         ("drag / scroll", "pan / zoom (zoom keeps cursor position)"),
         ("purple PC pin", "this computer - Shift+click the map to place it exactly"),
+        ("P / PC button", "center the map on the PC pin"),
         ("offline tiles", "python download_map.py  (run at home)"),
     ]
     disconnect_time = 0.0
@@ -1389,6 +1390,15 @@ def main():
 
     btn_start = pygame.Rect(0, 0, 0, 0)
     btn_clear = pygame.Rect(0, 0, 0, 0)
+    btn_pc = pygame.Rect(0, 0, 0, 0)
+
+    def center_pc():
+        pc = pc_loc[0]
+        if pc:
+            mapview.follow = False        # don't snap back to the boat
+            mapview.touched = True
+            mapview.center_on(pc["lat"], pc["lon"],
+                              mapview.z if mapview.z >= 13 else 16)
 
     def auto_ready():
         return (motors_on and connected and mapview.waypoints
@@ -1465,6 +1475,8 @@ def main():
                         mapview.set_rect(MAP_RECT_NORMAL)
                 elif e.key == pygame.K_f:
                     mapview.follow = True
+                elif e.key == pygame.K_p:
+                    center_pc()
                 elif e.key in (pygame.K_0, pygame.K_KP0):
                     link_up = time.time() - net["last_ack"] < 1.0
                     if e.mod & pygame.KMOD_SHIFT:
@@ -1553,6 +1565,8 @@ def main():
                 elif e.button == 1 and next(
                         (True for r, _ in w_btns if r.collidepoint(cpos)), False):
                     winch_cmd = next(c for r, c in w_btns if r.collidepoint(cpos))
+                elif btn_pc.collidepoint(cpos):
+                    center_pc()
                 elif btn_start.collidepoint(cpos):
                     toggle_mode()
                 elif btn_clear.collidepoint(cpos):
@@ -1804,6 +1818,11 @@ def main():
         if mode == "AUTO":
             text(canvas, "med", "AUTO", mapview.rect.right - 46,
                  mapview.rect.top + 20, ORANGE, center=True)
+        # center-on-PC button, bottom-right of the map above the attribution
+        btn_pc = button(canvas, (mapview.rect.right - 62,
+                                 mapview.rect.bottom - 58, 52, 26),
+                        "PC (P)", enabled=bool(pc_loc[0]),
+                        accent=(180, 120, 255))
         if edit_mode:
             # live heading stays visible while planning
             hdg_live = (nav.heading
