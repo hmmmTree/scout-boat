@@ -100,9 +100,6 @@ Preferences prefs;
 float magOffX = 0, magOffY = 0, magOffZ = 0;
 // runtime heading reference (HDGREF command: "the bow points north now")
 float hdgOff = 0;
-// staleness watchdog: a dying I2C joint must not freeze the heading
-unsigned long imuDataMs = 0, imuRetryMs = 0;
-bool imuStale = false;
 float lastMx = 0, lastMy = 0, lastMz = 0;      // raw, for diagnostics
 // MAGCAL state: collect raw min/max while the user rotates the boat
 bool magCalRunning = false;
@@ -311,23 +308,6 @@ void updateTelemetry() {
     telPitch = pitch * 180.0f / PI;
     telRoll  = roll * 180.0f / PI;
     telHaveHdg = true;
-    imuDataMs = millis();
-    imuStale = false;
-  }
-  // no fresh IMU data for 2s: stop reporting the frozen heading and try
-  // to bring the sensor back (loose wiring recovers on its own this way)
-  if (imuOk && imuDataMs && millis() - imuDataMs > 2000) {
-    imuStale = true;
-    telHaveHdg = false;
-    if (millis() - imuRetryMs > 5000) {
-      imuRetryMs = millis();
-      imu.begin(Wire, 1);
-      if (imu.status != ICM_20948_Stat_Ok) imu.begin(Wire, 0);
-      if (imu.status == ICM_20948_Stat_Ok) {
-        Serial.println("IMU: recovered");
-        imuDataMs = millis();
-      }
-    }
   }
 #endif
 #if USE_GPS
@@ -444,9 +424,7 @@ void loop() {
     lastStatusMs = millis();
     Serial.print("STATUS:");
 #if USE_IMU
-    if (imuOk && imuStale) {
-      Serial.print(" imu=STALE (wiring? retrying)");
-    } else if (imuOk) {
+    if (imuOk) {
       Serial.printf(" imu=OK hdg=%.0f pitch=%.0f roll=%.0f rawmag=%.0f/%.0f/%.0f",
                     telHdg, telPitch, telRoll, lastMx, lastMy, lastMz);
     } else {
