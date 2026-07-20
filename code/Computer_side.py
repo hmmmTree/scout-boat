@@ -70,6 +70,8 @@ TIMEOUT = 3
 
 # virtual canvas — everything is drawn at this size, then scaled to the window
 W, H = 1600, 900
+# default window size (the canvas letterbox-scales into whatever you resize to)
+WIN_W, WIN_H = 1280, 720
 
 # ---- theme ----
 BG      = (11, 13, 18)
@@ -749,9 +751,7 @@ def main():
 
     pygame.init()
     pygame.joystick.init()
-    # default window = exact canvas size: skips the per-frame smoothscale
-    # (the biggest single main-thread cost) unless the user resizes
-    screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
+    screen = pygame.display.set_mode((WIN_W, WIN_H), pygame.RESIZABLE)
     pygame.display.set_caption("BOAT DRIVER STATION")
     canvas = pygame.Surface((W, H))
     clock = pygame.time.Clock()
@@ -823,12 +823,12 @@ def main():
                 if e.key == pygame.K_F11:
                     fullscreen = not fullscreen
                     screen = pygame.display.set_mode(
-                        (0, 0) if fullscreen else (W, H),
+                        (0, 0) if fullscreen else (WIN_W, WIN_H),
                         pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE)
                 elif e.key == pygame.K_ESCAPE:
                     if fullscreen:
                         fullscreen = False
-                        screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
+                        screen = pygame.display.set_mode((WIN_W, WIN_H), pygame.RESIZABLE)
                     else:
                         running = False
                 elif e.key in (pygame.K_UP, pygame.K_RIGHT):
