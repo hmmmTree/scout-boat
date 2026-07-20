@@ -98,6 +98,8 @@ Preferences prefs;
 // live mag offsets: loaded from flash at boot (MAGCAL command refreshes
 // them at runtime, no reflash needed). Fall back to the constants above.
 float magOffX = 0, magOffY = 0, magOffZ = 0;
+// runtime heading reference (HDGREF command: "the bow points north now")
+float hdgOff = 0;
 float lastMx = 0, lastMy = 0, lastMz = 0;      // raw, for diagnostics
 // MAGCAL state: collect raw min/max while the user rotates the boat
 bool magCalRunning = false;
@@ -232,8 +234,10 @@ void setup() {
   magOffX = prefs.getFloat("mx", MAG_OFF_X);
   magOffY = prefs.getFloat("my", MAG_OFF_Y);
   magOffZ = prefs.getFloat("mz", MAG_OFF_Z);
-  Serial.printf("MAG offsets: %.1f %.1f %.1f  (send MAGCAL over serial to calibrate)\n",
-                magOffX, magOffY, magOffZ);
+  hdgOff  = prefs.getFloat("ho", HEADING_OFFSET_DEG);
+  Serial.printf("MAG offsets: %.1f %.1f %.1f  hdg ref: %+.1f\n",
+                magOffX, magOffY, magOffZ, hdgOff);
+  Serial.println("(MAGCAL = figure-8 cal, HDGREF = bow-is-north, *CLR to clear)");
 #endif
 }
 
@@ -297,7 +301,7 @@ void updateTelemetry() {
     float xh = mx * cosf(pitch) + mz * sinf(pitch);
     float yh = mx * sinf(roll) * sinf(pitch) + my * cosf(roll)
                - mz * sinf(roll) * cosf(pitch);
-    float hdg = atan2f(-yh, xh) * 180.0f / PI + HEADING_OFFSET_DEG;
+    float hdg = atan2f(-yh, xh) * 180.0f / PI + hdgOff;
     while (hdg < 0) hdg += 360.0f;
     while (hdg >= 360.0f) hdg -= 360.0f;
     telHdg = hdg;
@@ -344,6 +348,25 @@ void handleCommand(const char* buf, bool fromSerial) {
     magOffX = magOffY = magOffZ = 0;
     prefs.remove("mx"); prefs.remove("my"); prefs.remove("mz");
     Serial.println("MAGCLR: offsets cleared");
+    return;
+  }
+  if (strcmp(buf, "HDGREF") == 0) {
+    // the bow points north RIGHT NOW: fold current heading into the offset
+    if (telHaveHdg) {
+      hdgOff = hdgOff - telHdg;
+      while (hdgOff <= -180.0f) hdgOff += 360.0f;
+      while (hdgOff > 180.0f) hdgOff -= 360.0f;
+      prefs.putFloat("ho", hdgOff);
+      Serial.printf("HDGREF: bow = north captured, offset now %+.1f (saved)\n", hdgOff);
+    } else {
+      Serial.println("HDGREF: no heading available yet");
+    }
+    return;
+  }
+  if (strcmp(buf, "HDGCLR") == 0) {
+    hdgOff = HEADING_OFFSET_DEG;
+    prefs.remove("ho");
+    Serial.println("HDGCLR: heading reference cleared");
     return;
   }
 #endif
