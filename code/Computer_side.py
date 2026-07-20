@@ -1079,9 +1079,9 @@ def main():
         ("KEYBOARD", ""),
         ("SPACE", "arm / disarm (also: Square)"),
         ("M", "AUTO <-> TELEOP (also: Options)"),
-        ("E", "edit mode: full-screen map, motors disabled"),
+        ("E", "edit mode: full-screen map, drive disabled"),
         ("F", "map follows the boat again (also: Share)"),
-        ("I / K / O", "winch in / stop / out (also on-screen buttons)"),
+        ("I / K / O", "winch in / stop / out — works in EDIT mode too"),
         ("Arrows", "speed limit +/- (also: L1/R1 or D-pad up/down)"),
         ("C", "clear all waypoints"),
         ("H", "this panel"),
@@ -1176,8 +1176,9 @@ def main():
                     toggle_mode()
                 elif e.key == pygame.K_e:
                     edit_mode = not edit_mode
+                    winch_cmd = 90            # no surprise winch motion
                     if edit_mode:
-                        mode = "TELEOP"       # editing disables everything
+                        mode = "TELEOP"       # editing disables the drive
                         motors_on = False
                         mapview.set_rect(MAP_RECT_EDIT)
                     else:
@@ -1185,11 +1186,11 @@ def main():
                         mapview.set_rect(MAP_RECT_NORMAL)
                 elif e.key == pygame.K_f:
                     mapview.follow = True
-                elif e.key == pygame.K_i and not edit_mode:
+                elif e.key == pygame.K_i:
                     winch_cmd = 180
-                elif e.key == pygame.K_k and not edit_mode:
+                elif e.key == pygame.K_k:
                     winch_cmd = 90
-                elif e.key == pygame.K_o and not edit_mode:
+                elif e.key == pygame.K_o:
                     winch_cmd = 0
                 elif e.key == pygame.K_c:
                     mapview.clear_all()
@@ -1255,6 +1256,7 @@ def main():
             js = None
             disconnect_time = time.time()
         connected = js is not None
+        winch_live = None            # trigger hold-to-run, set while connected
 
         if connected:
             forward = -safe_axis(js, AXIS_LY)
@@ -1315,8 +1317,6 @@ def main():
                 winch_live = 180
             elif l2 > TRIGGER_ON:
                 winch_live = 0
-            else:
-                winch_live = None
 
             if motors_on:
                 lp = clamp(forward + turn, -1.0, 1.0)
@@ -1352,7 +1352,17 @@ def main():
             w_cmd = winch_cmd if motors_on else 90
 
         # hand the command to the 50Hz network thread (E:0 = instant stop)
-        net["cmd"] = (left_cmd, right_cmd, w_cmd, 1 if motors_on else 0)
+        # EDIT mode: drive is hard-locked to neutral, but the winch alone can
+        # run (I/K/O keys, on-screen buttons, or triggers). The enable flag
+        # goes up only while the winch is commanded, so everything else on
+        # the boat stays hard-stopped.
+        if edit_mode:
+            left_cmd = right_cmd = 90
+            w_cmd = winch_live if winch_live is not None else winch_cmd
+            en = 1 if w_cmd != 90 else 0
+        else:
+            en = 1 if motors_on else 0
+        net["cmd"] = (left_cmd, right_cmd, w_cmd, en)
         last_ack = net["last_ack"]
         ack_count = net["ack_count"]
         boat_ok = (time.time() - last_ack) < 1.0
@@ -1472,10 +1482,23 @@ def main():
                            accent=RED if in_auto else GREEN)
         btn_clear = button(canvas, (bar_x + 382, bar_y + 6, 100, 32), "CLEAR (C)")
         if edit_mode:
+            # winch stays operable while planning (drive locked at neutral)
+            text(canvas, "lbl", "WINCH", bar_x + 500, bar_y + 17, GREY)
+            w_btns = [
+                (button(canvas, (bar_x + 552, bar_y + 6, 64, 32), "IN(I)",
+                        accent=GREEN if w_cmd > 100 else BLUE), 180),
+                (button(canvas, (bar_x + 622, bar_y + 6, 64, 32), "STP(K)",
+                        accent=WHITE if w_cmd == 90 else BLUE), 90),
+                (button(canvas, (bar_x + 692, bar_y + 6, 64, 32), "OUT(O)",
+                        accent=ORANGE if 0 <= w_cmd < 80 else BLUE), 0),
+            ]
+            wstate = ("RUNNING IN" if w_cmd > 100 else
+                      ("RUNNING OUT" if w_cmd < 80 else "stopped"))
+            text(canvas, "med", wstate, bar_x + 768, bar_y + 13,
+                 GREEN if w_cmd > 100 else (ORANGE if w_cmd < 80 else DIM))
             text(canvas, "sm",
-                 "click add/select   drag move   r-click/DEL delete   "
-                 "[ ] hold ±5s   Ctrl+Z undo   E exit   H help",
-                 bar_x + 500, bar_y + 14, GREY)
+                 "click add   drag move   [ ] hold   Ctrl+Z undo   E exit   H help",
+                 bar_x + 926, bar_y + 14, GREY)
         elif in_auto:
             text(canvas, "lbl", auto_info, bar_x + 494, bar_y + 17, ORANGE)
         elif not auto_ready():
