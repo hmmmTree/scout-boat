@@ -101,6 +101,26 @@ def geo_dist_bearing(lat1, lon1, lat2, lon2):
     return math.hypot(x, y), math.degrees(math.atan2(x, y)) % 360.0
 
 
+# ---- user settings (S key panel), persisted to assets/settings.json ----
+SETTINGS = {"invert_hdg": False, "invert_roll": False, "invert_pitch": False}
+
+def load_settings():
+    try:
+        s = json.load(open(os.path.join(ASSET_DIR, "settings.json")))
+        for k in SETTINGS:
+            if k in s:
+                SETTINGS[k] = bool(s[k])
+    except Exception:
+        pass
+
+def save_settings():
+    try:
+        os.makedirs(ASSET_DIR, exist_ok=True)
+        json.dump(SETTINGS, open(os.path.join(ASSET_DIR, "settings.json"), "w"))
+    except Exception:
+        pass
+
+
 # ---- computer location (IP geolocation, city precision; cached offline) ----
 pc_loc = [None]
 
@@ -426,6 +446,13 @@ class Nav:
 
     def feed(self, lat, lon, heading, sats, speed=None, pitch=None, roll=None):
         self.lat, self.lon, self.sats = lat, lon, sats
+        # sensor-direction settings apply first (before zeroing offsets)
+        if heading is not None and SETTINGS["invert_hdg"]:
+            heading = (360.0 - heading) % 360.0
+        if roll is not None and SETTINGS["invert_roll"]:
+            roll = -roll
+        if pitch is not None and SETTINGS["invert_pitch"]:
+            pitch = -pitch
         self._raw = (heading, pitch, roll)
         if heading is not None:
             heading = (heading - self.cal["hdg"]) % 360.0
@@ -1277,8 +1304,11 @@ def main():
     motors_on = False              # SAFETY: always start disarmed
     mode = "TELEOP"                # "TELEOP" | "AUTO"
     edit_mode = False              # keyboard E only — mission editing
+    load_settings()
     help_open = False
     help_scroll = 0
+    settings_open = False
+    settings_rows = []           # (Rect, key) built each frame while open
     cal_toast = ("", 0.0)
     mission = {"idx": 0, "phase": "transit", "until": 0.0}
     auto_info = ""
@@ -1302,6 +1332,7 @@ def main():
         ("0", "current heading becomes 000 (saved on the boat) +"),
         ("", "  pitch/roll zeroed. Level boat; bow north for true bearings"),
         ("Shift+0", "clear heading + attitude calibration"),
+        ("S", "settings: invert heading / roll / pitch direction"),
         ("H", "this panel"),
         ("F11 / ESC", "fullscreen / leave fullscreen or quit"),
         ("", ""),
@@ -1379,6 +1410,8 @@ def main():
                 elif e.key == pygame.K_ESCAPE:
                     if help_open:
                         help_open = False
+                    elif settings_open:
+                        settings_open = False
                     elif fullscreen:
                         fullscreen = False
                         screen = pygame.display.set_mode((WIN_W, WIN_H), pygame.RESIZABLE)
@@ -1387,6 +1420,13 @@ def main():
                 elif e.key == pygame.K_h:
                     help_open = not help_open
                     help_scroll = 0
+                elif e.key == pygame.K_s:
+                    settings_open = not settings_open
+                elif settings_open and e.key in (pygame.K_1, pygame.K_2, pygame.K_3):
+                    k = {pygame.K_1: "invert_hdg", pygame.K_2: "invert_roll",
+                         pygame.K_3: "invert_pitch"}[e.key]
+                    SETTINGS[k] = not SETTINGS[k]
+                    save_settings()
                 elif e.key in (pygame.K_UP, pygame.K_RIGHT):
                     speed = clamp(round(speed + 0.1, 1), 0.0, 2.0)
                 elif e.key in (pygame.K_DOWN, pygame.K_LEFT):
@@ -1450,7 +1490,17 @@ def main():
                     mapview.undo()
             elif e.type == pygame.MOUSEBUTTONDOWN:
                 cpos = to_canvas(e.pos)
-                if help_open:
+                if settings_open:
+                    if e.button == 1:
+                        hit = False
+                        for rect, k in settings_rows:
+                            if rect.collidepoint(cpos):
+                                SETTINGS[k] = not SETTINGS[k]
+                                save_settings()
+                                hit = True
+                        if not hit:
+                            settings_open = False
+                elif help_open:
                     if e.button == 4:
                         help_scroll = max(0, help_scroll - 3)
                     elif e.button == 5:
@@ -1816,6 +1866,34 @@ def main():
         # calibration toast (0 / Shift+0)
         if time.time() - cal_toast[1] < 3.0 and cal_toast[0]:
             text(canvas, "med", cal_toast[0], W // 2, H - 56, YELLOW, center=True)
+
+        # -- settings overlay (S): sensor direction toggles --
+        settings_rows = []
+        if settings_open:
+            shade = pygame.Surface((W, H), pygame.SRCALPHA)
+            shade.fill((0, 0, 0, 150))
+            canvas.blit(shade, (0, 0))
+            sw_, sh_ = 470, 250
+            sx, sy = (W - sw_) // 2, (H - sh_) // 2
+            panel(canvas, sx, sy, sw_, sh_, PANEL)
+            text(canvas, "big", "SETTINGS", sx + 24, sy + 16, WHITE)
+            text(canvas, "lbl", "S or ESC closes", sx + sw_ - 120, sy + 26, GREY)
+            rows = [("invert_hdg",   "1  Invert heading direction"),
+                    ("invert_roll",  "2  Invert roll"),
+                    ("invert_pitch", "3  Invert pitch")]
+            for i, (k, label) in enumerate(rows):
+                ry = sy + 60 + i * 42
+                r = pygame.Rect(sx + 20, ry, sw_ - 40, 36)
+                pygame.draw.rect(canvas, PANEL2, r, border_radius=8)
+                text(canvas, "med", label, sx + 36, ry + 9, WHITE)
+                on = SETTINGS[k]
+                text(canvas, "med", "ON" if on else "off",
+                     sx + sw_ - 70, ry + 9, GREEN if on else DIM)
+                settings_rows.append((r, k))
+            text(canvas, "lbl",
+                 "applies to compass, 3D, map and autopilot — press 0 to "
+                 "re-zero after changing",
+                 sx + 24, sy + sh_ - 26, GREY)
 
         # -- help overlay (H): scrollable controls reference --
         if help_open:
