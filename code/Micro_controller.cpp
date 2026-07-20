@@ -99,6 +99,7 @@ float telLat = 0, telLon = 0, telSpd = 0;
 float telHdg = 0, telPitch = 0, telRoll = 0;
 int   telSats = 0;
 bool  telHaveFix = false, telHaveHdg = false;
+unsigned long lastStatusMs = 0;   // 5s health print over serial
 
 // ---- Throttle ramp (anti-brownout) ----
 // XIAO's small regulator needs a gentle ramp; a dev board can move much faster.
@@ -273,6 +274,28 @@ void updateTelemetry() {
 
 void loop() {
   updateTelemetry();
+
+  // periodic health line so the serial monitor doubles as a sensor check
+  if (millis() - lastStatusMs >= 5000) {
+    lastStatusMs = millis();
+    Serial.print("STATUS:");
+#if USE_IMU
+    if (imuOk) {
+      Serial.printf(" imu=OK hdg=%.0f pitch=%.0f roll=%.0f", telHdg, telPitch, telRoll);
+    } else {
+      Serial.print(" imu=MISSING");
+    }
+#endif
+#if USE_GPS
+    Serial.printf(" | gps_chars=%lu sentences=%lu sats=%d fix=%s",
+                  (unsigned long)gps.charsProcessed(),
+                  (unsigned long)gps.sentencesWithFix(),
+                  gps.satellites.isValid() ? (int)gps.satellites.value() : -1,
+                  telHaveFix ? "YES" : "no");
+    if (gps.charsProcessed() < 10) Serial.print("  <- NO DATA: check TX->16 RX->17 wiring");
+#endif
+    Serial.println();
+  }
 
   // ---- receive commands -> set TARGETS (don't write directly) ----
   int packetSize = udp.parsePacket();
