@@ -339,7 +339,30 @@ def save_pc_loc():
 def _pc_locator():
     pc_loc[0] = load_pc_cache()
     if pc_loc[0] and pc_loc[0].get("manual"):
-        return                       # user pinned it by hand; IP guess is worse
+        return                       # user pinned it by hand; guesses are worse
+    # 1st choice: Windows WiFi positioning (tens of meters in a city)
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Add-Type -AssemblyName System.Device; "
+             "$w = New-Object System.Device.Location.GeoCoordinateWatcher; "
+             "$w.Start(); $t = 0; "
+             "while ($w.Position.Location.IsUnknown -and $t -lt 40) "
+             "{ Start-Sleep -Milliseconds 500; $t++ }; "
+             "$l = $w.Position.Location; $w.Stop(); "
+             "if (-not $l.IsUnknown) { '{0:F6},{1:F6},{2:F0}' "
+             "-f $l.Latitude, $l.Longitude, $l.HorizontalAccuracy }"],
+            capture_output=True, text=True, timeout=35,
+            creationflags=subprocess.CREATE_NO_WINDOW).stdout.strip()
+        if out:
+            lat, lon, acc = out.split(",")
+            pc_loc[0] = {"lat": float(lat), "lon": float(lon),
+                         "city": f"Windows WiFi fix (~{acc}m)", "source": "win"}
+            save_pc_loc()
+            return
+    except Exception:
+        pass
+    # fallback: IP geolocation (city precision only)
     try:
         with urllib.request.urlopen(
                 "http://ip-api.com/json/?fields=status,lat,lon,city", timeout=8) as r:
