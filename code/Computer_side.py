@@ -42,7 +42,7 @@ ESP32_IP   = "192.168.4.1"
 ESP32_PORT = 4210
 SEND_HZ    = 50
 BOAT_SSID  = "BoatControl"
-CAMERA_URL = "http://192.168.4.2:81/stream"   # ESP32-CAM MJPEG stream
+CAMERA_URL = "http://192.168.4.10:81/stream"  # XIAO ESP32-S3 Sense (boat_cam.ino)
 MODEL_YAW_OFFSET = 0    # degrees; set 180 if the 3D boat renders stern-first
 
 AXIS_LY = 1
@@ -851,7 +851,7 @@ def main():
         panel(canvas, 1098, 738, 478, 62)
         text(canvas, "lbl", "SENSORS", 1112, 748, GREY)
         text(canvas, "sm",
-             "GPS: u-blox M10   IMU: 9-axis   CAM: ESP32-CAM",
+             "GPS: u-blox M10   IMU: 9-axis   CAM: XIAO S3 Sense",
              1112, 768, GREY)
 
         text(canvas, "sm",
