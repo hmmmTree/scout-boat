@@ -89,10 +89,20 @@ bool gpsBaudSwitched = false;   // M10 modules ship at 9600 or 38400; autodetect
 #endif
 #if USE_IMU
 #include <Wire.h>
+#include <Preferences.h>
 #include "ICM_20948.h"
 ICM_20948_I2C imu;
 bool imuOk = false;
 unsigned long lastImuMs = 0;
+Preferences prefs;
+// live mag offsets: loaded from flash at boot (MAGCAL command refreshes
+// them at runtime, no reflash needed). Fall back to the constants above.
+float magOffX = 0, magOffY = 0, magOffZ = 0;
+float lastMx = 0, lastMy = 0, lastMz = 0;      // raw, for diagnostics
+// MAGCAL state: collect raw min/max while the user rotates the boat
+bool magCalRunning = false;
+unsigned long magCalEndMs = 0, magCalNoteMs = 0;
+float cMinX, cMaxX, cMinY, cMaxY, cMinZ, cMaxZ;
 #endif
 // latest readings for the telemetry ack
 float telLat = 0, telLon = 0, telSpd = 0;
@@ -218,6 +228,12 @@ void setup() {
   if (imu.status != ICM_20948_Stat_Ok) imu.begin(Wire, 0);   // then 0x68
   imuOk = (imu.status == ICM_20948_Stat_Ok);
   Serial.println(imuOk ? "IMU: ICM-20948 online" : "IMU: not found (telemetry degrades)");
+  prefs.begin("boatcal", false);
+  magOffX = prefs.getFloat("mx", MAG_OFF_X);
+  magOffY = prefs.getFloat("my", MAG_OFF_Y);
+  magOffZ = prefs.getFloat("mz", MAG_OFF_Z);
+  Serial.printf("MAG offsets: %.1f %.1f %.1f  (send MAGCAL over serial to calibrate)\n",
+                magOffX, magOffY, magOffZ);
 #endif
 }
 
@@ -245,10 +261,37 @@ void updateTelemetry() {
     lastImuMs = millis();
     imu.getAGMT();
     float ax = imu.accX(), ay = imu.accY(), az = imu.accZ();
+    lastMx = imu.magX(); lastMy = imu.magY(); lastMz = imu.magZ();
+
+    if (magCalRunning) {
+      cMinX = min(cMinX, lastMx); cMaxX = max(cMaxX, lastMx);
+      cMinY = min(cMinY, lastMy); cMaxY = max(cMaxY, lastMy);
+      cMinZ = min(cMinZ, lastMz); cMaxZ = max(cMaxZ, lastMz);
+      if (millis() - magCalNoteMs > 3000) {
+        magCalNoteMs = millis();
+        Serial.printf("MAGCAL: %lus left  spread x=%.0f y=%.0f z=%.0f (want >40 each)\n",
+                      (magCalEndMs - millis()) / 1000,
+                      cMaxX - cMinX, cMaxY - cMinY, cMaxZ - cMinZ);
+      }
+      if (millis() >= magCalEndMs) {
+        magCalRunning = false;
+        magOffX = (cMinX + cMaxX) / 2;
+        magOffY = (cMinY + cMaxY) / 2;
+        magOffZ = (cMinZ + cMaxZ) / 2;
+        prefs.putFloat("mx", magOffX);
+        prefs.putFloat("my", magOffY);
+        prefs.putFloat("mz", magOffZ);
+        Serial.printf("MAGCAL DONE: offsets %.1f %.1f %.1f saved "
+                      "(spread %.0f/%.0f/%.0f)\n",
+                      magOffX, magOffY, magOffZ,
+                      cMaxX - cMinX, cMaxY - cMinY, cMaxZ - cMinZ);
+      }
+    }
+
     // AK09916 axes vs accel axes on this chip: y and z are inverted
-    float mx = imu.magX() - MAG_OFF_X;
-    float my = -(imu.magY() - MAG_OFF_Y);
-    float mz = -(imu.magZ() - MAG_OFF_Z);
+    float mx = lastMx - magOffX;
+    float my = -(lastMy - magOffY);
+    float mz = -(lastMz - magOffZ);
     float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
     float roll  = atan2f(ay, az);
     float xh = mx * cosf(pitch) + mz * sinf(pitch);
@@ -286,6 +329,24 @@ void buildAck(char* out, size_t n) {
 // Same protocol over WiFi UDP or the USB serial cable. Acks return on
 // whichever transport the command arrived on.
 void handleCommand(const char* buf, bool fromSerial) {
+#if USE_IMU
+  if (strcmp(buf, "MAGCAL") == 0) {
+    magCalRunning = true;
+    magCalEndMs = millis() + 40000;
+    magCalNoteMs = 0;
+    cMinX = cMinY = cMinZ = 1e9;
+    cMaxX = cMaxY = cMaxZ = -1e9;
+    Serial.println("MAGCAL: rotate the boat slowly through ALL directions "
+                   "(figure-8, roll it too) for 40 seconds...");
+    return;
+  }
+  if (strcmp(buf, "MAGCLR") == 0) {
+    magOffX = magOffY = magOffZ = 0;
+    prefs.remove("mx"); prefs.remove("my"); prefs.remove("mz");
+    Serial.println("MAGCLR: offsets cleared");
+    return;
+  }
+#endif
   int l, r, w, en = 1;
   int n = sscanf(buf, "L:%d,R:%d,W:%d,E:%d", &l, &r, &w, &en);
   if (n < 3) return;
@@ -341,7 +402,8 @@ void loop() {
     Serial.print("STATUS:");
 #if USE_IMU
     if (imuOk) {
-      Serial.printf(" imu=OK hdg=%.0f pitch=%.0f roll=%.0f", telHdg, telPitch, telRoll);
+      Serial.printf(" imu=OK hdg=%.0f pitch=%.0f roll=%.0f rawmag=%.0f/%.0f/%.0f",
+                    telHdg, telPitch, telRoll, lastMx, lastMy, lastMz);
     } else {
       Serial.print(" imu=MISSING");
     }
