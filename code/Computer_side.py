@@ -51,6 +51,12 @@ BOAT_SSID  = "BoatControl"
 CAMERA_URL = "http://192.168.4.10:81/stream"  # XIAO ESP32-S3 Sense (boat_cam.ino)
 MODEL_YAW_OFFSET = 0    # degrees; set 180 if the 3D boat renders stern-first
 
+# ---- autonomous mode tuning ----
+WP_RADIUS_M   = 3.0    # waypoint reached within this many meters
+AUTO_CRUISE   = 0.55   # cruise throttle fraction while on course
+AUTO_TURN_GAIN = 0.7   # how hard heading error steers
+STICK_OVERRIDE = 0.25  # stick deflection that kicks AUTO back to TELEOP
+
 AXIS_LY = 1
 AXIS_RX = 2
 BTN_CROSS    = 0
@@ -246,6 +252,38 @@ def parse_ack(data, nav):
         nav.feed(lat, lon, hdg, sats, spd, pitch, roll)
     except (ValueError, IndexError):
         pass
+
+
+def autopilot_step(nav, waypoints, idx, speed_limit):
+    """One guidance step toward waypoints[idx].
+
+    Returns (left_cmd, right_cmd, new_idx, done, info_str). Station-side
+    autopilot: uses GPS position + compass heading from telemetry and
+    steers with the same differential mix as teleop.
+    """
+    bx, by = nav.trail[-1]
+    tx, ty = waypoints[idx]
+    dx, dy = tx - bx, ty - by
+    dist = math.hypot(dx, dy)
+    if dist < WP_RADIUS_M:
+        idx += 1
+        if idx >= len(waypoints):
+            return 90, 90, idx, True, "MISSION COMPLETE"
+        return 90, 90, idx, False, f"WP {idx} reached"
+    bearing = math.degrees(math.atan2(dx, dy)) % 360.0   # 0 = north
+    err = (bearing - nav.heading + 540.0) % 360.0 - 180.0
+    turn = clamp(err / 60.0, -1.0, 1.0) * AUTO_TURN_GAIN
+    if abs(err) > 70:
+        fwd = 0.12                       # mostly rotate in place
+    else:
+        fwd = AUTO_CRUISE * max(0.25, math.cos(math.radians(err)))
+    cap = clamp(min(speed_limit, 1.0), 0.0, 1.0)
+    lp = clamp(fwd + turn, -1.0, 1.0) * cap
+    rp = clamp(fwd - turn, -1.0, 1.0) * cap
+    left_cmd  = int(clamp(90 + lp * 90, 0, 180))
+    right_cmd = int(clamp(90 + rp * 90, 0, 180))
+    return left_cmd, right_cmd, idx, False, \
+        f"WP {idx + 1}/{len(waypoints)}  {dist:.0f}m  err {err:+.0f}°"
 
 
 # ---- drawing helpers ----
@@ -448,7 +486,7 @@ class MapView:
     def mouse_up(self):
         self._drag_idx = None
 
-    def draw(self, surf, nav):
+    def draw(self, surf, nav, target_idx=None):
         r = self.rect
         panel(surf, r.x, r.y, r.w, r.h, (16, 19, 26))
         clip_prev = surf.get_clip()
@@ -478,9 +516,16 @@ class MapView:
             pygame.draw.lines(surf, (60, 90, 140), False, [(hx, hy)] + pts, 2)
         for i, p in enumerate(pts):
             grabbed = (i == self._drag_idx)
+            active = (i == target_idx)
             pygame.draw.circle(surf, YELLOW if grabbed else BLUE, p, 9 if grabbed else 7)
             pygame.draw.circle(surf, WHITE, p, 9 if grabbed else 7, width=1)
+            if active:
+                pygame.draw.circle(surf, ORANGE, p, 13, width=2)
             text(surf, "lbl", str(i + 1), p[0], p[1], BG if grabbed else WHITE, center=True)
+        # guidance line: boat -> active target
+        if target_idx is not None and target_idx < len(pts) and nav.trail:
+            bp = self.world_to_px(*nav.trail[-1])
+            pygame.draw.line(surf, ORANGE, bp, pts[target_idx], 2)
 
         if len(nav.trail) > 1:
             pygame.draw.lines(surf, (40, 160, 120), False,
@@ -728,7 +773,9 @@ def main():
     js = None
     speed = 1.0
     motors_on = False              # SAFETY: always start disarmed
-    mission_on = False
+    mode = "TELEOP"                # "TELEOP" | "AUTO"
+    wp_index = 0
+    auto_info = ""
     winch_cmd = 90
     w_cmd = 90
     left_cmd = right_cmd = 90
@@ -737,6 +784,7 @@ def main():
     cam_decoded = None
     cam_last_decode = 0.0
     running = True
+    connected = False
 
     net = {"run": True, "cmd": (90, 90, 90, 0), "last_ack": 0.0, "ack_count": 0}
     threading.Thread(target=_net_worker, args=(sock, net, nav), daemon=True).start()
@@ -750,6 +798,21 @@ def main():
 
     btn_start = pygame.Rect(0, 0, 0, 0)
     btn_clear = pygame.Rect(0, 0, 0, 0)
+
+    def auto_ready():
+        return (motors_on and connected and mapview.waypoints
+                and nav.alive and nav.has_fix and nav.heading is not None
+                and len(nav.trail) > 0)
+
+    def toggle_mode():
+        nonlocal mode, wp_index, auto_info
+        if mode == "AUTO":
+            mode = "TELEOP"
+            auto_info = ""
+        elif auto_ready():
+            mode = "AUTO"
+            wp_index = 0
+            auto_info = "engaging"
 
     while running:
         dt = clock.get_time() / 1000.0
@@ -774,9 +837,11 @@ def main():
                     speed = clamp(round(speed - 0.1, 1), 0.0, 2.0)
                 elif e.key == pygame.K_SPACE:
                     motors_on = not motors_on
+                elif e.key == pygame.K_m:
+                    toggle_mode()
                 elif e.key == pygame.K_c:
                     mapview.clear_all()
-                    mission_on = False
+                    mode = "TELEOP"
                 elif e.key == pygame.K_z and (e.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)):
                     mapview.undo()
             elif e.type == pygame.MOUSEBUTTONDOWN:
@@ -787,11 +852,10 @@ def main():
                 elif e.button == 1 and boat3d.mouse_down(cpos):
                     pass
                 elif btn_start.collidepoint(cpos):
-                    if nav.has_fix and mapview.waypoints:
-                        mission_on = not mission_on
+                    toggle_mode()
                 elif btn_clear.collidepoint(cpos):
                     mapview.clear_all()
-                    mission_on = False
+                    mode = "TELEOP"
                 else:
                     mapview.mouse_down(cpos, e.button)
             elif e.type == pygame.MOUSEBUTTONUP:
@@ -864,8 +928,25 @@ def main():
             else:
                 left_cmd = right_cmd = 90
                 w_cmd = 90
+                mode = "TELEOP"          # disarm always exits AUTO
+
+            # ---- AUTO mode: station-side autopilot drives L/R ----
+            if mode == "AUTO":
+                if abs(forward) > STICK_OVERRIDE or abs(turn) > STICK_OVERRIDE:
+                    mode = "TELEOP"       # pilot grabbed the sticks
+                    auto_info = "stick override"
+                elif not (nav.alive and nav.has_fix and nav.heading is not None
+                          and nav.trail and wp_index < len(mapview.waypoints)):
+                    left_cmd = right_cmd = 90   # telemetry lost: hold neutral
+                    auto_info = "AUTO PAUSED — no telemetry"
+                else:
+                    left_cmd, right_cmd, wp_index, done, auto_info = \
+                        autopilot_step(nav, mapview.waypoints, wp_index, speed)
+                    if done:
+                        mode = "TELEOP"
         else:
             left_cmd = right_cmd = 90
+            mode = "TELEOP"               # controller is the deadman switch
             if time.time() - disconnect_time < TIMEOUT:
                 w_cmd = winch_cmd
             else:
@@ -943,20 +1024,37 @@ def main():
 
         # -- middle column: navigation --
         text(canvas, "lbl", "NAVIGATION", 472, 74, GREY)
-        mapview.draw(canvas, nav)
+        mapview.draw(canvas, nav,
+                     wp_index if mode == "AUTO" and wp_index < len(mapview.waypoints)
+                     else None)
+        if mode == "AUTO":
+            text(canvas, "med", "AUTO", mapview.rect.right - 46,
+                 mapview.rect.top + 20, ORANGE, center=True)
 
         bar_y = 96 + 580 + 8
         panel(canvas, 472, bar_y, 610, 44)
         wp_n = len(mapview.waypoints)
-        text(canvas, "med", f"WAYPOINTS: {wp_n}", 488, bar_y + 13, WHITE)
-        mission_ok = nav.has_fix and wp_n > 0
+        in_auto = (mode == "AUTO")
+        # mode chip
+        pygame.draw.rect(canvas, PANEL2, (482, bar_y + 6, 118, 32), border_radius=8)
+        text(canvas, "med", mode, 482 + 59, bar_y + 22,
+             ORANGE if in_auto else BLUE, center=True)
+        text(canvas, "med", f"WP: {wp_n}", 616, bar_y + 13, WHITE)
         btn_start = button(canvas, (688, bar_y + 6, 156, 32),
-                           "STOP MISSION" if mission_on else "START MISSION",
-                           enabled=mission_ok,
-                           accent=RED if mission_on else GREEN)
+                           "STOP AUTO (M)" if in_auto else "START AUTO (M)",
+                           enabled=in_auto or auto_ready(),
+                           accent=RED if in_auto else GREEN)
         btn_clear = button(canvas, (854, bar_y + 6, 100, 32), "CLEAR (C)")
-        if not nav.has_fix:
-            text(canvas, "lbl", "needs GPS (M10)", 968, bar_y + 17, DIM)
+        if in_auto:
+            text(canvas, "lbl", auto_info, 966, bar_y + 17, ORANGE)
+        elif not auto_ready():
+            need = "needs: "
+            if not motors_on: need += "ARM "
+            if not connected: need += "controller "
+            if not (nav.alive and nav.has_fix): need += "GPS "
+            elif nav.heading is None: need += "heading "
+            if not wp_n: need += "waypoints"
+            text(canvas, "lbl", need.strip(), 966, bar_y + 17, DIM)
 
         # tiles under mission bar: SPEED / HEADING / POSITION
         t_y = bar_y + 52
@@ -988,9 +1086,9 @@ def main():
              1112, 768, GREY)
 
         text(canvas, "sm",
-             "L1/R1|Arrows speed   SQUARE|SPACE arm   TRI/O/X winch   "
-             "map: click add / drag move / r-click delete / Ctrl+Z undo   "
-             "drag 3D = orbit   F11 fullscreen",
+             "SQUARE|SPACE arm   M auto/teleop (sticks always override)   "
+             "L1/R1|Arrows speed   TRI/O/X winch   "
+             "map: click add / drag move / r-click del / Ctrl+Z undo   F11",
              24, H - 26, GREY)
 
         # ---- letterbox scale to window ----
