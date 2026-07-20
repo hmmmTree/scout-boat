@@ -130,16 +130,25 @@ def load_pc_cache():
     except Exception:
         return None
 
+def save_pc_loc():
+    try:
+        os.makedirs(ASSET_DIR, exist_ok=True)
+        json.dump(pc_loc[0], open(os.path.join(ASSET_DIR, "pc_location.json"), "w"))
+    except Exception:
+        pass
+
+
 def _pc_locator():
     pc_loc[0] = load_pc_cache()
+    if pc_loc[0] and pc_loc[0].get("manual"):
+        return                       # user pinned it by hand; IP guess is worse
     try:
         with urllib.request.urlopen(
                 "http://ip-api.com/json/?fields=status,lat,lon,city", timeout=8) as r:
             d = json.loads(r.read().decode())
         if d.get("status") == "success":
             pc_loc[0] = {"lat": d["lat"], "lon": d["lon"], "city": d.get("city", "")}
-            os.makedirs(ASSET_DIR, exist_ok=True)
-            json.dump(pc_loc[0], open(os.path.join(ASSET_DIR, "pc_location.json"), "w"))
+            save_pc_loc()
     except Exception:
         pass
 
@@ -1358,7 +1367,7 @@ def main():
         ("", ""),
         ("MAP", ""),
         ("drag / scroll", "pan / zoom (zoom keeps cursor position)"),
-        ("purple PC pin", "this computer (IP location, city precision)"),
+        ("purple PC pin", "this computer - Shift+click the map to place it exactly"),
         ("offline tiles", "python download_map.py  (run at home)"),
     ]
     disconnect_time = 0.0
@@ -1427,6 +1436,15 @@ def main():
                          pygame.K_3: "invert_pitch"}[e.key]
                     SETTINGS[k] = not SETTINGS[k]
                     save_settings()
+                elif settings_open and e.key == pygame.K_4:
+                    pc_loc[0] = None
+                    try:
+                        os.remove(os.path.join(ASSET_DIR, "pc_location.json"))
+                    except OSError:
+                        pass
+                    threading.Thread(target=_pc_locator, daemon=True).start()
+                    cal_toast = ("re-detecting PC location via IP "
+                                 "(needs internet)", time.time())
                 elif e.key in (pygame.K_UP, pygame.K_RIGHT):
                     speed = clamp(round(speed + 0.1, 1), 0.0, 2.0)
                 elif e.key in (pygame.K_DOWN, pygame.K_LEFT):
@@ -1495,9 +1513,22 @@ def main():
                         hit = False
                         for rect, k in settings_rows:
                             if rect.collidepoint(cpos):
-                                SETTINGS[k] = not SETTINGS[k]
-                                save_settings()
                                 hit = True
+                                if k == "pc_redetect":
+                                    pc_loc[0] = None
+                                    try:
+                                        os.remove(os.path.join(
+                                            ASSET_DIR, "pc_location.json"))
+                                    except OSError:
+                                        pass
+                                    threading.Thread(target=_pc_locator,
+                                                     daemon=True).start()
+                                    cal_toast = ("re-detecting PC location "
+                                                 "via IP (needs internet)",
+                                                 time.time())
+                                else:
+                                    SETTINGS[k] = not SETTINGS[k]
+                                    save_settings()
                         if not hit:
                             settings_open = False
                 elif help_open:
@@ -1510,6 +1541,15 @@ def main():
                 elif e.button in (4, 5):
                     if mapview.rect.collidepoint(cpos):
                         mapview.zoom_at(cpos, 1 if e.button == 4 else -1)
+                elif (e.button == 1
+                      and pygame.key.get_mods() & pygame.KMOD_SHIFT
+                      and mapview.rect.collidepoint(cpos)):
+                    lat, lon = mapview.screen_to_ll(*cpos)
+                    pc_loc[0] = {"lat": lat, "lon": lon,
+                                 "city": "pinned manually", "manual": True}
+                    save_pc_loc()
+                    cal_toast = ("PC location pinned here — Settings (S) "
+                                 "re-detects via IP", time.time())
                 elif e.button == 1 and next(
                         (True for r, _ in w_btns if r.collidepoint(cpos)), False):
                     winch_cmd = next(c for r, c in w_btns if r.collidepoint(cpos))
@@ -1873,7 +1913,7 @@ def main():
             shade = pygame.Surface((W, H), pygame.SRCALPHA)
             shade.fill((0, 0, 0, 150))
             canvas.blit(shade, (0, 0))
-            sw_, sh_ = 470, 250
+            sw_, sh_ = 470, 300
             sx, sy = (W - sw_) // 2, (H - sh_) // 2
             panel(canvas, sx, sy, sw_, sh_, PANEL)
             text(canvas, "big", "SETTINGS", sx + 24, sy + 16, WHITE)
@@ -1890,9 +1930,21 @@ def main():
                 text(canvas, "med", "ON" if on else "off",
                      sx + sw_ - 70, ry + 9, GREEN if on else DIM)
                 settings_rows.append((r, k))
+            # PC pin row: action, not a toggle (Shift+click on map sets it)
+            ry = sy + 60 + 3 * 42
+            r = pygame.Rect(sx + 20, ry, sw_ - 40, 36)
+            pygame.draw.rect(canvas, PANEL2, r, border_radius=8)
+            text(canvas, "med", "4  PC pin: re-detect via IP", sx + 36, ry + 9, WHITE)
+            pc_mode = ("manual" if pc_loc[0] and pc_loc[0].get("manual")
+                       else "auto")
+            text(canvas, "med", pc_mode, sx + sw_ - 90, ry + 9,
+                 CYAN if pc_mode == "manual" else GREY)
+            settings_rows.append((r, "pc_redetect"))
             text(canvas, "lbl",
-                 "applies to compass, 3D, map and autopilot — press 0 to "
-                 "re-zero after changing",
+                 "inverts apply everywhere — press 0 to re-zero after changing.",
+                 sx + 24, sy + sh_ - 44, GREY)
+            text(canvas, "lbl",
+                 "PC pin: Shift+click anywhere on the map to place it exactly.",
                  sx + 24, sy + sh_ - 26, GREY)
 
         # -- help overlay (H): scrollable controls reference --
