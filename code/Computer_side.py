@@ -102,7 +102,9 @@ def geo_dist_bearing(lat1, lon1, lat2, lon2):
 
 
 # ---- user settings (S key panel), persisted to assets/settings.json ----
-SETTINGS = {"invert_hdg": False, "invert_roll": False, "invert_pitch": False}
+SETTINGS = {"invert_hdg": False, "invert_roll": False, "invert_pitch": False,
+            "mavlink": True}
+MAVLINK_PORT = 14550     # Mission Planner: Connect -> UDP -> this port
 
 def load_settings():
     try:
@@ -119,6 +121,159 @@ def save_settings():
         json.dump(SETTINGS, open(os.path.join(ASSET_DIR, "settings.json"), "w"))
     except Exception:
         pass
+
+
+class MavBridge:
+    """Live MAVLink feed so Mission Planner can watch and command the boat.
+
+    Sends heartbeat (surface boat), attitude, position and GPS status to
+    udp 127.0.0.1:MAVLINK_PORT (Mission Planner: Connect -> UDP -> 14550).
+    Accepts mission uploads from MP's Plan screen (NAV_WAYPOINT rows become
+    our waypoints, param1 delay -> hold) and arm/disarm commands; those
+    arrive in self.inbox and the GUI thread applies them.
+    """
+
+    def __init__(self, nav, get_state):
+        self.nav = nav
+        self.get_state = get_state
+        self.inbox = deque()
+        self.connected_at = 0.0
+        self.run = True
+        self.ok = False
+        self.err = ""
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    @property
+    def gcs_connected(self):
+        return (time.time() - self.connected_at) < 5.0
+
+    def _worker(self):
+        try:
+            from pymavlink import mavutil
+        except ImportError:
+            self.err = "pymavlink not installed"
+            return
+        try:
+            conn = mavutil.mavlink_connection(
+                f"udpout:127.0.0.1:{MAVLINK_PORT}",
+                source_system=1, source_component=1)
+        except Exception as ex:
+            self.err = str(ex)
+            return
+        self.ok = True
+        mav = conn.mav
+        ml = mavutil.mavlink
+        t0 = time.time()
+        last_hb = last_pos = last_att = 0.0
+        upload = None
+        while self.run:
+            now = time.time()
+            bms = int((now - t0) * 1000) & 0x7FFFFFFF
+            st = self.get_state()
+            nav = self.nav
+            try:
+                if now - last_hb >= 1.0:
+                    last_hb = now
+                    base = ml.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+                    if st["armed"]:
+                        base |= ml.MAV_MODE_FLAG_SAFETY_ARMED
+                    custom = 10 if st["mode"] == "AUTO" else 0  # rover AUTO/MANUAL
+                    mav.heartbeat_send(ml.MAV_TYPE_SURFACE_BOAT,
+                                       ml.MAV_AUTOPILOT_ARDUPILOTMEGA,
+                                       base, custom, ml.MAV_STATE_ACTIVE)
+                if now - last_att >= 0.2 and nav.alive and nav.heading is not None:
+                    last_att = now
+                    mav.attitude_send(bms,
+                                      math.radians(nav.roll or 0.0),
+                                      math.radians(nav.pitch or 0.0),
+                                      math.radians(nav.heading), 0, 0, 0)
+                if now - last_pos >= 0.5 and nav.alive and nav.has_fix:
+                    last_pos = now
+                    spd = int((nav.speed or 0) * 100)
+                    mav.global_position_int_send(
+                        bms, int(nav.lat * 1e7), int(nav.lon * 1e7), 0, 0,
+                        spd, 0, 0, int((nav.heading or 0) * 100))
+                    mav.gps_raw_int_send(bms * 1000, 3, int(nav.lat * 1e7),
+                                         int(nav.lon * 1e7), 0, 65535, 65535,
+                                         spd, 65535, nav.sats)
+                    mav.vfr_hud_send(nav.speed or 0.0, nav.speed or 0.0,
+                                     int(nav.heading or 0), 0, 0, 0)
+            except Exception:
+                pass
+
+            while True:
+                try:
+                    msg = conn.recv_match(blocking=False)
+                except Exception:
+                    break
+                if msg is None:
+                    break
+                self.connected_at = now
+                t = msg.get_type()
+                try:
+                    if t == "MISSION_COUNT":
+                        upload = {"count": msg.count, "items": {}}
+                        mav.mission_request_int_send(msg.get_srcSystem(),
+                                                     msg.get_srcComponent(), 0)
+                    elif t in ("MISSION_ITEM_INT", "MISSION_ITEM") and upload:
+                        if t == "MISSION_ITEM_INT":
+                            lat, lon = msg.x / 1e7, msg.y / 1e7
+                        else:
+                            lat, lon = msg.x, msg.y
+                        upload["items"][msg.seq] = (msg.command, msg.param1, lat, lon)
+                        nxt = msg.seq + 1
+                        if nxt < upload["count"]:
+                            mav.mission_request_int_send(
+                                msg.get_srcSystem(), msg.get_srcComponent(), nxt)
+                        else:
+                            mav.mission_ack_send(msg.get_srcSystem(),
+                                                 msg.get_srcComponent(), 0)
+                            wps = []
+                            for s in sorted(upload["items"]):
+                                cmd, p1, lat, lon = upload["items"][s]
+                                if cmd == 16 and s > 0 and \
+                                        (abs(lat) > 1e-9 or abs(lon) > 1e-9):
+                                    wps.append({"lat": lat, "lon": lon,
+                                                "hold": clamp(p1, 0, 600),
+                                                "wa": "none", "ws": 5})
+                            if wps:
+                                self.inbox.append(("mission", wps))
+                            upload = None
+                    elif t == "MISSION_REQUEST_LIST":
+                        wl = st["waypoints"]
+                        mav.mission_count_send(msg.get_srcSystem(),
+                                               msg.get_srcComponent(),
+                                               len(wl) + 1 if wl else 0)
+                    elif t in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
+                        wl = st["waypoints"]
+                        seq = msg.seq
+                        if seq == 0 and wl:
+                            lat, lon, p1 = wl[0]["lat"], wl[0]["lon"], 0.0
+                        elif 0 < seq <= len(wl):
+                            w = wl[seq - 1]
+                            lat, lon, p1 = w["lat"], w["lon"], w.get("hold", 0)
+                        else:
+                            continue
+                        mav.mission_item_int_send(
+                            msg.get_srcSystem(), msg.get_srcComponent(), seq,
+                            3, 16, 1 if seq == 0 else 0, 1,
+                            p1, 0, 0, 0, int(lat * 1e7), int(lon * 1e7), 0)
+                    elif t == "PARAM_REQUEST_LIST":
+                        mav.param_value_send(b"SYSID_THISMAV", 1.0,
+                                             ml.MAV_PARAM_TYPE_INT32, 1, 0)
+                    elif t == "COMMAND_LONG":
+                        if msg.command == ml.MAV_CMD_COMPONENT_ARM_DISARM:
+                            self.inbox.append(("arm", msg.param1 >= 0.5))
+                            mav.command_ack_send(msg.command, 0)
+                        else:
+                            mav.command_ack_send(msg.command, 3)
+                except Exception:
+                    pass
+            time.sleep(0.02)
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ---- Mission Planner interop: QGC WPL 110 .waypoints files ----
@@ -1388,9 +1543,10 @@ def main():
         ("H", "this panel"),
         ("", ""),
         ("MISSION PLANNER", ""),
+        ("live link", "MP: Connect -> UDP -> port 14550 (bridge on by default)"),
+        ("", "boat shows live on MP's map; Plan -> Write uploads waypoints here"),
         ("drag & drop", "a .waypoints file onto this window loads the mission"),
         ("Ctrl+S", "save mission as .waypoints (assets/missions/)"),
-        ("", "plan in Mission Planner's map -> save -> drop here -> AUTO"),
         ("F11 / ESC", "fullscreen / leave fullscreen or quit"),
         ("", ""),
         ("EDIT MODE (keyboard E)", ""),
@@ -1427,6 +1583,12 @@ def main():
 
     net = {"run": True, "cmd": (90, 90, 90, 0), "last_ack": 0.0,
            "ack_count": 0, "transport": "WiFi", "oneshot": None}
+
+    def mav_state():
+        return {"armed": motors_on, "mode": mode,
+                "waypoints": [dict(w) for w in mapview.waypoints]}
+
+    mavbridge = MavBridge(nav, mav_state) if SETTINGS["mavlink"] else None
     threading.Thread(target=_net_worker, args=(sock, net, nav), daemon=True).start()
 
     def to_canvas(pos):
@@ -1515,6 +1677,14 @@ def main():
                          pygame.K_3: "invert_pitch"}[e.key]
                     SETTINGS[k] = not SETTINGS[k]
                     save_settings()
+                elif settings_open and e.key == pygame.K_5:
+                    SETTINGS["mavlink"] = not SETTINGS["mavlink"]
+                    save_settings()
+                    if SETTINGS["mavlink"] and mavbridge is None:
+                        mavbridge = MavBridge(nav, mav_state)
+                    elif not SETTINGS["mavlink"] and mavbridge:
+                        mavbridge.run = False
+                        mavbridge = None
                 elif settings_open and e.key == pygame.K_4:
                     pc_loc[0] = None
                     try:
@@ -1620,6 +1790,14 @@ def main():
                                     cal_toast = ("re-detecting PC location "
                                                  "via IP (needs internet)",
                                                  time.time())
+                                elif k == "mavlink":
+                                    SETTINGS[k] = not SETTINGS[k]
+                                    save_settings()
+                                    if SETTINGS[k] and mavbridge is None:
+                                        mavbridge = MavBridge(nav, mav_state)
+                                    elif not SETTINGS[k] and mavbridge:
+                                        mavbridge.run = False
+                                        mavbridge = None
                                 else:
                                     SETTINGS[k] = not SETTINGS[k]
                                     save_settings()
@@ -1777,6 +1955,25 @@ def main():
             mode = "TELEOP"               # controller is the deadman for AUTO
             # keyboard / on-screen winch still works while armed
             w_cmd = winch_cmd if motors_on else 90
+
+        # ---- apply things Mission Planner sent through the bridge ----
+        if mavbridge:
+            while mavbridge.inbox:
+                kind, val = mavbridge.inbox.popleft()
+                if kind == "mission":
+                    mapview._push()
+                    mapview.waypoints = val
+                    mapview.sel = None
+                    mode = "TELEOP"
+                    mapview.center_on(val[0]["lat"], val[0]["lon"],
+                                      max(mapview.z, 15))
+                    mapview.follow = False
+                    cal_toast = (f"mission from Mission Planner: "
+                                 f"{len(val)} waypoints", time.time())
+                elif kind == "arm" and not edit_mode:
+                    motors_on = bool(val)
+                    cal_toast = (f"Mission Planner: "
+                                 f"{'ARM' if val else 'DISARM'}", time.time())
 
         # hand the command to the 50Hz network thread (E:0 = instant stop)
         # EDIT mode: everything hard-disabled (winch actions are PLANNED
@@ -1997,7 +2194,16 @@ def main():
             text(canvas, "lbl", "SENSORS", 1112, 748, GREY)
             text(canvas, "sm",
                  "GPS: u-blox M10   IMU: 9-axis   CAM: XIAO S3 Sense",
-                 1112, 768, GREY)
+                 1112, 764, GREY)
+            if mavbridge is None:
+                mav_txt, mav_col = "MAVLINK: off (Settings 5)", DIM
+            elif mavbridge.err:
+                mav_txt, mav_col = f"MAVLINK: {mavbridge.err}", RED
+            elif mavbridge.gcs_connected:
+                mav_txt, mav_col = "MAVLINK: Mission Planner connected", GREEN
+            else:
+                mav_txt, mav_col = f"MAVLINK: waiting on udp {MAVLINK_PORT}", GREY
+            text(canvas, "sm", mav_txt, 1112, 782, mav_col)
 
             text(canvas, "sm",
                  "H = all controls    SPACE arm    M auto/teleop    "
@@ -2014,7 +2220,7 @@ def main():
             shade = pygame.Surface((W, H), pygame.SRCALPHA)
             shade.fill((0, 0, 0, 150))
             canvas.blit(shade, (0, 0))
-            sw_, sh_ = 470, 300
+            sw_, sh_ = 470, 345
             sx, sy = (W - sw_) // 2, (H - sh_) // 2
             panel(canvas, sx, sy, sw_, sh_, PANEL)
             text(canvas, "big", "SETTINGS", sx + 24, sy + 16, WHITE)
@@ -2041,6 +2247,16 @@ def main():
             text(canvas, "med", pc_mode, sx + sw_ - 90, ry + 9,
                  CYAN if pc_mode == "manual" else GREY)
             settings_rows.append((r, "pc_redetect"))
+            # MAVLink bridge toggle
+            ry = sy + 60 + 4 * 42
+            r = pygame.Rect(sx + 20, ry, sw_ - 40, 36)
+            pygame.draw.rect(canvas, PANEL2, r, border_radius=8)
+            text(canvas, "med", "5  MAVLink bridge (Mission Planner)",
+                 sx + 36, ry + 9, WHITE)
+            text(canvas, "med", "ON" if SETTINGS["mavlink"] else "off",
+                 sx + sw_ - 70, ry + 9,
+                 GREEN if SETTINGS["mavlink"] else DIM)
+            settings_rows.append((r, "mavlink"))
             text(canvas, "lbl",
                  "inverts apply everywhere — press 0 to re-zero after changing.",
                  sx + 24, sy + sh_ - 44, GREY)
@@ -2101,6 +2317,8 @@ def main():
         clock.tick(SEND_HZ)
 
     net["run"] = False
+    if mavbridge:
+        mavbridge.run = False
     time.sleep(0.05)
     try:
         sock.sendto(b"L:90,R:90,W:90,E:0", (ESP32_IP, ESP32_PORT))
