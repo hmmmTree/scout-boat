@@ -324,25 +324,67 @@ def parse_ack(data, nav):
         pass
 
 
-def autopilot_step(nav, waypoints, idx, speed_limit, hold_until, now):
-    """One guidance step toward waypoints[idx] (geographic).
+def _phase_seq(wp):
+    """Ordered action phases executed at a waypoint after arrival."""
+    seq = []
+    wa = wp.get("wa", "none")
+    if wa in ("out", "sample"):
+        seq.append("winch_out")
+    if wp.get("hold", 0) > 0:
+        seq.append("dwell")
+    if wa in ("in", "sample"):
+        seq.append("winch_in")
+    return seq
 
-    Returns (left, right, new_idx, hold_until, done, info). Waypoints are
-    dicts {'lat','lon','hold'} — 'hold' is seconds to station-hold after
-    arriving (ArduPilot-style per-waypoint delay).
+
+def autopilot_step(nav, waypoints, st, speed_limit, now):
+    """One guidance step. st is the mission state dict:
+        {"idx": waypoint index, "phase": "transit"|..., "until": t}
+
+    Returns (left, right, winch_or_None, done, info). Waypoints are dicts
+    {'lat','lon','hold','wa','ws'}: on arrival the boat runs its winch
+    action ('out'/'in'/'sample') for 'ws' seconds around a 'hold' dwell —
+    lower probe -> soak -> raise probe — then sails on. winch=None means
+    the pilot's manual winch commands stay live (transit only).
     """
-    if hold_until and now < hold_until:
-        return 90, 90, idx, hold_until, False, f"HOLD {hold_until - now:.0f}s"
+    idx = st["idx"]
     wp = waypoints[idx]
+    phase = st["phase"]
+
+    if phase != "transit":
+        rem = st["until"] - now
+        if rem > 0:
+            if phase == "winch_out":
+                return 90, 90, 0, False, f"WP{idx+1}: probe down {rem:.0f}s"
+            if phase == "winch_in":
+                return 90, 90, 180, False, f"WP{idx+1}: probe up {rem:.0f}s"
+            return 90, 90, 90, False, f"WP{idx+1}: dwell {rem:.0f}s"
+        seq = _phase_seq(wp)
+        pos = seq.index(phase) if phase in seq else len(seq) - 1
+        if pos + 1 < len(seq):
+            nxt = seq[pos + 1]
+            st["phase"] = nxt
+            st["until"] = now + (wp.get("hold", 0) if nxt == "dwell"
+                                 else wp.get("ws", 5))
+            return 90, 90, 90, False, f"WP{idx+1}: next {nxt}"
+        st["idx"] += 1
+        st["phase"] = "transit"
+        if st["idx"] >= len(waypoints):
+            return 90, 90, 90, True, "MISSION COMPLETE"
+        return 90, 90, 90, False, f"WP {idx+1} done"
+
     dist, bearing = geo_dist_bearing(nav.lat, nav.lon, wp["lat"], wp["lon"])
     if dist < WP_RADIUS_M:
-        hold = float(wp.get("hold", 0))
-        idx += 1
-        if idx >= len(waypoints):
-            return 90, 90, idx, 0, True, "MISSION COMPLETE"
-        if hold > 0:
-            return 90, 90, idx, now + hold, False, f"WP reached — hold {hold:.0f}s"
-        return 90, 90, idx, 0, False, f"WP {idx} reached"
+        seq = _phase_seq(wp)
+        if seq:
+            st["phase"] = seq[0]
+            st["until"] = now + (wp.get("hold", 0) if seq[0] == "dwell"
+                                 else wp.get("ws", 5))
+            return 90, 90, 90, False, f"WP{idx+1}: arrived, {seq[0]}"
+        st["idx"] += 1
+        if st["idx"] >= len(waypoints):
+            return 90, 90, 90, True, "MISSION COMPLETE"
+        return 90, 90, 90, False, f"WP {idx+1} reached"
     err = (bearing - nav.heading + 540.0) % 360.0 - 180.0
     turn = clamp(err / 60.0, -1.0, 1.0) * AUTO_TURN_GAIN
     if abs(err) > 70:
@@ -354,7 +396,7 @@ def autopilot_step(nav, waypoints, idx, speed_limit, hold_until, now):
     rp = clamp(fwd - turn, -1.0, 1.0) * cap
     left_cmd  = int(clamp(90 + lp * 90, 0, 180))
     right_cmd = int(clamp(90 + rp * 90, 0, 180))
-    return left_cmd, right_cmd, idx, 0, False, \
+    return left_cmd, right_cmd, None, False, \
         f"WP {idx + 1}/{len(waypoints)}  {dist:.0f}m  err {err:+.0f}°"
 
 
@@ -625,6 +667,22 @@ class MapView:
             wp = self.waypoints[self.sel]
             wp["hold"] = clamp(wp.get("hold", 0) + delta, 0, 600)
 
+    WA_CYCLE = ["none", "out", "in", "sample"]
+    WA_LABEL = {"none": "—", "out": "v OUT", "in": "^ IN", "sample": "v^ SMP"}
+
+    def cycle_winch(self):
+        if self.sel is not None and self.sel < len(self.waypoints):
+            self._push()
+            wp = self.waypoints[self.sel]
+            cur = self.WA_CYCLE.index(wp.get("wa", "none"))
+            wp["wa"] = self.WA_CYCLE[(cur + 1) % len(self.WA_CYCLE)]
+
+    def adjust_ws(self, delta):
+        if self.sel is not None and self.sel < len(self.waypoints):
+            self._push()
+            wp = self.waypoints[self.sel]
+            wp["ws"] = clamp(wp.get("ws", 5) + delta, 1, 120)
+
     def _hit(self, pos):
         for i, wp in enumerate(self.waypoints):
             px, py = self.ll_to_screen(wp["lat"], wp["lon"])
@@ -684,7 +742,8 @@ class MapView:
             # a clean click on empty map: add a waypoint there
             lat, lon = self.screen_to_ll(*self._down)
             self._push()
-            self.waypoints.append({"lat": lat, "lon": lon, "hold": 0})
+            self.waypoints.append({"lat": lat, "lon": lon, "hold": 0,
+                                   "wa": "none", "ws": 5})
             self.sel = len(self.waypoints) - 1
         if self._grab_clean:
             # grabbed a waypoint but never moved it: drop the no-op undo entry
@@ -765,6 +824,13 @@ class MapView:
             hold = self.waypoints[i].get("hold", 0)
             if hold:
                 text(surf, "lbl", f"{hold:.0f}s", p[0], p[1] + 16, YELLOW, center=True)
+            wa = self.waypoints[i].get("wa", "none")
+            if wa != "none":
+                ws = self.waypoints[i].get("ws", 5)
+                mark = {"out": "v", "in": "^", "sample": "v^"}[wa]
+                wcol = {"out": ORANGE, "in": GREEN, "sample": CYAN}[wa]
+                text(surf, "lbl", f"{mark}{ws:.0f}s", p[0],
+                     p[1] + (30 if hold else 16), wcol, center=True)
 
         # boat trail + boat
         if len(nav.trail) > 1:
@@ -790,10 +856,10 @@ class MapView:
             if self.waypoints:
                 rows = min(len(self.waypoints), 14)
                 th = 20 * rows + 30
-                ov = pygame.Surface((190, th), pygame.SRCALPHA)
+                ov = pygame.Surface((252, th), pygame.SRCALPHA)
                 ov.fill((14, 17, 23, 225))
                 surf.blit(ov, (r.x + 2, r.y + 32))
-                text(surf, "lbl", " #    LEG    HOLD", r.x + 12, r.y + 38, GREY)
+                text(surf, "lbl", " #    LEG   HOLD   WINCH", r.x + 12, r.y + 38, GREY)
                 prev = None
                 total = 0.0
                 for i, w in enumerate(self.waypoints):
@@ -805,8 +871,11 @@ class MapView:
                         d = 0.0
                     if i < rows:
                         ycol = CYAN if i == self.sel else WHITE
+                        wa = w.get("wa", "none")
+                        wtxt = ("  --" if wa == "none" else
+                                f"{self.WA_LABEL[wa]} {w.get('ws', 5):.0f}s")
                         text(surf, "sm",
-                             f"{i+1:>2}  {d:>5.0f}m  {w.get('hold',0):>3.0f}s",
+                             f"{i+1:>2} {d:>5.0f}m {w.get('hold',0):>3.0f}s  {wtxt}",
                              r.x + 12, r.y + 54 + 20 * i, ycol)
                     prev = w
                 text(surf, "lbl", f"route {total:.0f}m",
@@ -1064,8 +1133,7 @@ def main():
     edit_mode = False              # keyboard E only — mission editing
     help_open = False
     help_scroll = 0
-    wp_index = 0
-    hold_until = 0.0
+    mission = {"idx": 0, "phase": "transit", "until": 0.0}
     auto_info = ""
     winch_cmd = 90
     w_cmd = 90
@@ -1079,9 +1147,9 @@ def main():
         ("KEYBOARD", ""),
         ("SPACE", "arm / disarm (also: Square)"),
         ("M", "AUTO <-> TELEOP (also: Options)"),
-        ("E", "edit mode: full-screen map, drive disabled"),
+        ("E", "edit mode: full-screen map, everything disabled"),
         ("F", "map follows the boat again (also: Share)"),
-        ("I / K / O", "winch in / stop / out — works in EDIT mode too"),
+        ("I / K / O", "winch in / stop / out (driving screen)"),
         ("Arrows", "speed limit +/- (also: L1/R1 or D-pad up/down)"),
         ("C", "clear all waypoints"),
         ("H", "this panel"),
@@ -1091,7 +1159,10 @@ def main():
         ("click", "add waypoint / select one"),
         ("drag waypoint", "move it"),
         ("right-click / DEL", "delete waypoint / delete selected"),
-        ("[ / ]", "selected waypoint hold time -/+5s"),
+        ("[ / ]", "selected waypoint hold (dwell) time -/+5s"),
+        ("W", "cycle winch action: — / vOUT / ^IN / v^SAMPLE"),
+        ("- / =", "winch action run time -/+1s"),
+        ("", "at the waypoint: probe down -> dwell -> probe up"),
         ("Ctrl+Z", "undo any mission edit"),
         ("", ""),
         ("CONTROLLER (DS4)", ""),
@@ -1134,14 +1205,13 @@ def main():
                 and nav.alive and nav.has_fix and nav.heading is not None)
 
     def toggle_mode():
-        nonlocal mode, wp_index, auto_info, hold_until
+        nonlocal mode, auto_info, mission
         if mode == "AUTO":
             mode = "TELEOP"
             auto_info = ""
         elif auto_ready():
             mode = "AUTO"
-            wp_index = 0
-            hold_until = 0.0
+            mission = {"idx": 0, "phase": "transit", "until": 0.0}
             auto_info = "engaging"
 
     while running:
@@ -1186,11 +1256,17 @@ def main():
                         mapview.set_rect(MAP_RECT_NORMAL)
                 elif e.key == pygame.K_f:
                     mapview.follow = True
-                elif e.key == pygame.K_i:
+                elif e.key == pygame.K_w and edit_mode:
+                    mapview.cycle_winch()
+                elif e.key == pygame.K_MINUS and edit_mode:
+                    mapview.adjust_ws(-1)
+                elif e.key == pygame.K_EQUALS and edit_mode:
+                    mapview.adjust_ws(+1)
+                elif e.key == pygame.K_i and not edit_mode:
                     winch_cmd = 180
-                elif e.key == pygame.K_k:
+                elif e.key == pygame.K_k and not edit_mode:
                     winch_cmd = 90
-                elif e.key == pygame.K_o:
+                elif e.key == pygame.K_o and not edit_mode:
                     winch_cmd = 0
                 elif e.key == pygame.K_c:
                     mapview.clear_all()
@@ -1330,19 +1406,21 @@ def main():
                 w_cmd = 90
                 mode = "TELEOP"          # disarm always exits AUTO
 
-            # ---- AUTO mode: station-side autopilot drives L/R ----
+            # ---- AUTO mode: station-side autopilot drives L/R (+winch) ----
             if mode == "AUTO":
                 if abs(forward) > STICK_OVERRIDE or abs(turn) > STICK_OVERRIDE:
                     mode = "TELEOP"       # pilot grabbed the sticks
                     auto_info = "stick override"
                 elif not (nav.alive and nav.has_fix and nav.heading is not None
-                          and wp_index < len(mapview.waypoints)):
+                          and mission["idx"] < len(mapview.waypoints)):
                     left_cmd = right_cmd = 90   # telemetry lost: hold neutral
                     auto_info = "AUTO PAUSED — no telemetry"
                 else:
-                    left_cmd, right_cmd, wp_index, hold_until, done, auto_info = \
-                        autopilot_step(nav, mapview.waypoints, wp_index, speed,
-                                       hold_until, time.time())
+                    left_cmd, right_cmd, w_auto, done, auto_info = \
+                        autopilot_step(nav, mapview.waypoints, mission, speed,
+                                       time.time())
+                    if w_auto is not None:
+                        w_cmd = w_auto        # planned winch action running
                     if done:
                         mode = "TELEOP"
         else:
@@ -1352,14 +1430,12 @@ def main():
             w_cmd = winch_cmd if motors_on else 90
 
         # hand the command to the 50Hz network thread (E:0 = instant stop)
-        # EDIT mode: drive is hard-locked to neutral, but the winch alone can
-        # run (I/K/O keys, on-screen buttons, or triggers). The enable flag
-        # goes up only while the winch is commanded, so everything else on
-        # the boat stays hard-stopped.
+        # EDIT mode: everything hard-disabled (winch actions are PLANNED
+        # into waypoints here, not run live — the autopilot executes them)
         if edit_mode:
             left_cmd = right_cmd = 90
-            w_cmd = winch_live if winch_live is not None else winch_cmd
-            en = 1 if w_cmd != 90 else 0
+            w_cmd = 90
+            en = 0
         else:
             en = 1 if motors_on else 0
         net["cmd"] = (left_cmd, right_cmd, w_cmd, en)
@@ -1455,8 +1531,8 @@ def main():
         if not edit_mode:
             text(canvas, "lbl", "NAVIGATION", 472, 74, GREY)
         mapview.draw(canvas, nav,
-                     wp_index if mode == "AUTO" and wp_index < len(mapview.waypoints)
-                     else None,
+                     mission["idx"] if mode == "AUTO"
+                     and mission["idx"] < len(mapview.waypoints) else None,
                      edit_mode)
         if mode == "AUTO":
             text(canvas, "med", "AUTO", mapview.rect.right - 46,
@@ -1482,23 +1558,22 @@ def main():
                            accent=RED if in_auto else GREEN)
         btn_clear = button(canvas, (bar_x + 382, bar_y + 6, 100, 32), "CLEAR (C)")
         if edit_mode:
-            # winch stays operable while planning (drive locked at neutral)
-            text(canvas, "lbl", "WINCH", bar_x + 500, bar_y + 17, GREY)
-            w_btns = [
-                (button(canvas, (bar_x + 552, bar_y + 6, 64, 32), "IN(I)",
-                        accent=GREEN if w_cmd > 100 else BLUE), 180),
-                (button(canvas, (bar_x + 622, bar_y + 6, 64, 32), "STP(K)",
-                        accent=WHITE if w_cmd == 90 else BLUE), 90),
-                (button(canvas, (bar_x + 692, bar_y + 6, 64, 32), "OUT(O)",
-                        accent=ORANGE if 0 <= w_cmd < 80 else BLUE), 0),
-            ]
-            wstate = ("RUNNING IN" if w_cmd > 100 else
-                      ("RUNNING OUT" if w_cmd < 80 else "stopped"))
-            text(canvas, "med", wstate, bar_x + 768, bar_y + 13,
-                 GREEN if w_cmd > 100 else (ORANGE if w_cmd < 80 else DIM))
+            sel_wp = (mapview.waypoints[mapview.sel]
+                      if mapview.sel is not None
+                      and mapview.sel < len(mapview.waypoints) else None)
+            if sel_wp:
+                wa = sel_wp.get("wa", "none")
+                text(canvas, "med",
+                     f"WP{mapview.sel+1}: winch {MapView.WA_LABEL[wa]}"
+                     + (f" {sel_wp.get('ws',5):.0f}s" if wa != "none" else "")
+                     + f"   hold {sel_wp.get('hold',0):.0f}s",
+                     bar_x + 500, bar_y + 13, CYAN)
+            else:
+                text(canvas, "sm", "select a waypoint to set its winch action",
+                     bar_x + 500, bar_y + 14, DIM)
             text(canvas, "sm",
-                 "click add   drag move   [ ] hold   Ctrl+Z undo   E exit   H help",
-                 bar_x + 926, bar_y + 14, GREY)
+                 "W winch action   -/= seconds   [ ] hold   Ctrl+Z undo   E exit   H help",
+                 bar_x + 940, bar_y + 14, GREY)
         elif in_auto:
             text(canvas, "lbl", auto_info, bar_x + 494, bar_y + 17, ORANGE)
         elif not auto_ready():
