@@ -3,9 +3,13 @@
 Keys / controls:
   F11        fullscreen toggle          SPACE / Square   arm-disarm
   Arrows or L1/R1  speed limit          ESC              exit fullscreen / quit
-  TRI/O/X    winch in/stop/out          C                clear waypoints
-  Map: click = add waypoint, drag one = move it, right-click one = delete,
-       Ctrl+Z = undo, C = clear all, scroll = zoom
+  TRI/O/X    winch in/stop/out          M                AUTO <-> TELEOP
+  E          EDIT MODE (keyboard only)  F                re-follow boat on map
+  Map (always): drag = pan, scroll = zoom.  OSM tiles cache to assets/tiles
+  and work offline once downloaded (Philippines overview pre-cached).
+  EDIT MODE only: click = add/select waypoint, drag one = move it,
+  right-click = delete, DEL = delete selected, [ / ] = hold time -/+5s,
+  Ctrl+Z = undo, C = clear all.  Purple pin = this computer (IP location).
   3D view: drag to orbit
 
 Network protocol (UDP to 192.168.4.1:4210):
@@ -27,6 +31,7 @@ Requires: pygame-ce (or pygame), numpy.
 The 3D view loads assets/boat_mesh.npz — converted from "Twin v2.step".
 """
 import io
+import json
 import math
 import os
 import socket
@@ -56,6 +61,63 @@ WP_RADIUS_M   = 3.0    # waypoint reached within this many meters
 AUTO_CRUISE   = 0.55   # cruise throttle fraction while on course
 AUTO_TURN_GAIN = 0.7   # how hard heading error steers
 STICK_OVERRIDE = 0.25  # stick deflection that kicks AUTO back to TELEOP
+HOLD_STEP_S   = 5      # [ / ] adjust a waypoint's hold time by this many seconds
+
+# ---- map / tiles ----
+TILESIZE = 256
+TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+TILE_UA  = "ScoutBoatDriverStation/1.0 (personal robotics project)"
+PH_CENTER = (12.8797, 121.7740)     # Philippines overview
+_here = os.path.dirname(os.path.abspath(__file__))
+ASSET_DIR = (os.path.join(_here, "assets")
+             if os.path.isdir(os.path.join(_here, "assets"))
+             else os.path.normpath(os.path.join(_here, "..", "assets")))
+
+
+def _ll_to_world(lat, lon, z):
+    """lat/lon -> Web Mercator pixel coords at zoom z."""
+    n = (1 << z) * TILESIZE
+    x = (lon + 180.0) / 360.0 * n
+    lr = math.radians(clamp(lat, -85.05, 85.05))
+    y = (1.0 - math.log(math.tan(lr) + 1.0 / math.cos(lr)) / math.pi) / 2.0 * n
+    return x, y
+
+
+def _world_to_ll(x, y, z):
+    n = (1 << z) * TILESIZE
+    lon = x / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * y / n))))
+    return lat, lon
+
+
+def geo_dist_bearing(lat1, lon1, lat2, lon2):
+    """meters + compass bearing between nearby points (equirectangular)."""
+    x = (lon2 - lon1) * 111320.0 * math.cos(math.radians((lat1 + lat2) / 2.0))
+    y = (lat2 - lat1) * 110540.0
+    return math.hypot(x, y), math.degrees(math.atan2(x, y)) % 360.0
+
+
+# ---- computer location (IP geolocation, city precision; cached offline) ----
+pc_loc = [None]
+
+def load_pc_cache():
+    try:
+        return json.load(open(os.path.join(ASSET_DIR, "pc_location.json")))
+    except Exception:
+        return None
+
+def _pc_locator():
+    pc_loc[0] = load_pc_cache()
+    try:
+        with urllib.request.urlopen(
+                "http://ip-api.com/json/?fields=status,lat,lon,city", timeout=8) as r:
+            d = json.loads(r.read().decode())
+        if d.get("status") == "success":
+            pc_loc[0] = {"lat": d["lat"], "lon": d["lon"], "city": d.get("city", "")}
+            os.makedirs(ASSET_DIR, exist_ok=True)
+            json.dump(pc_loc[0], open(os.path.join(ASSET_DIR, "pc_location.json"), "w"))
+    except Exception:
+        pass
 
 AXIS_LY = 1
 AXIS_RX = 2
@@ -222,7 +284,7 @@ class Nav:
         if self.has_fix:
             if self.origin is None:
                 self.origin = (lat, lon)
-            self.trail.append(self.to_local(lat, lon))
+            self.trail.append((lat, lon))       # geographic trail
 
     def to_local(self, lat, lon):
         if self.origin is None:
@@ -256,23 +318,25 @@ def parse_ack(data, nav):
         pass
 
 
-def autopilot_step(nav, waypoints, idx, speed_limit):
-    """One guidance step toward waypoints[idx].
+def autopilot_step(nav, waypoints, idx, speed_limit, hold_until, now):
+    """One guidance step toward waypoints[idx] (geographic).
 
-    Returns (left_cmd, right_cmd, new_idx, done, info_str). Station-side
-    autopilot: uses GPS position + compass heading from telemetry and
-    steers with the same differential mix as teleop.
+    Returns (left, right, new_idx, hold_until, done, info). Waypoints are
+    dicts {'lat','lon','hold'} — 'hold' is seconds to station-hold after
+    arriving (ArduPilot-style per-waypoint delay).
     """
-    bx, by = nav.trail[-1]
-    tx, ty = waypoints[idx]
-    dx, dy = tx - bx, ty - by
-    dist = math.hypot(dx, dy)
+    if hold_until and now < hold_until:
+        return 90, 90, idx, hold_until, False, f"HOLD {hold_until - now:.0f}s"
+    wp = waypoints[idx]
+    dist, bearing = geo_dist_bearing(nav.lat, nav.lon, wp["lat"], wp["lon"])
     if dist < WP_RADIUS_M:
+        hold = float(wp.get("hold", 0))
         idx += 1
         if idx >= len(waypoints):
-            return 90, 90, idx, True, "MISSION COMPLETE"
-        return 90, 90, idx, False, f"WP {idx} reached"
-    bearing = math.degrees(math.atan2(dx, dy)) % 360.0   # 0 = north
+            return 90, 90, idx, 0, True, "MISSION COMPLETE"
+        if hold > 0:
+            return 90, 90, idx, now + hold, False, f"WP reached — hold {hold:.0f}s"
+        return 90, 90, idx, 0, False, f"WP {idx} reached"
     err = (bearing - nav.heading + 540.0) % 360.0 - 180.0
     turn = clamp(err / 60.0, -1.0, 1.0) * AUTO_TURN_GAIN
     if abs(err) > 70:
@@ -284,7 +348,7 @@ def autopilot_step(nav, waypoints, idx, speed_limit):
     rp = clamp(fwd - turn, -1.0, 1.0) * cap
     left_cmd  = int(clamp(90 + lp * 90, 0, 180))
     right_cmd = int(clamp(90 + rp * 90, 0, 180))
-    return left_cmd, right_cmd, idx, False, \
+    return left_cmd, right_cmd, idx, 0, False, \
         f"WP {idx + 1}/{len(waypoints)}  {dist:.0f}m  err {err:+.0f}°"
 
 
@@ -414,36 +478,119 @@ def compass(surf, x, y, size, heading):
 
 
 class MapView:
-    """Local-frame map: meters relative to first GPS fix.
+    """Slippy-tile world map (OpenStreetMap) with mission planning.
 
-    Waypoint editing: click empty water = add, drag a waypoint = move it,
-    right-click a waypoint = delete it, Ctrl+Z = undo any of the above.
+    View mode (always): drag = pan, scroll = zoom, F = re-follow the boat.
+    EDIT mode (keyboard E only): click water = add waypoint, click one =
+    select, drag one = move, right-click one = delete, DEL = delete
+    selected, [ / ] = hold time -/+, Ctrl+Z = undo. Tiles cache to
+    assets/tiles and keep working offline once downloaded.
     """
 
     HIT_PX = 13
 
-    def __init__(self, rect):
+    def __init__(self, rect, center, zoom):
         self.rect = pygame.Rect(rect)
-        self.m_per_px = 0.5
-        self.waypoints = []          # [[x_m, y_m], ...]
+        self.lat, self.lon = center
+        self.z = zoom
+        self.waypoints = []          # [{'lat','lon','hold'}]
+        self.sel = None
+        self.follow = True
+        self.touched = False         # user panned/zoomed at least once
         self._history = []
         self._drag_idx = None
+        self._panning = False
+        self._down = None
+        self._last = None
+        self._moved = False
+        self._grab_clean = False     # drag started but nothing moved yet
+        self._tiles = {}             # (z,x,y) -> Surface
+        self._pending = set()
+        self._fail = {}              # (z,x,y) -> retry-after timestamp
+        self._qlock = threading.Lock()
+        threading.Thread(target=self._fetcher, daemon=True).start()
 
-    def world_to_px(self, wx, wy):
-        return (int(self.rect.centerx + wx / self.m_per_px),
-                int(self.rect.centery - wy / self.m_per_px))
+    # ---- geo <-> screen ----
+    def ll_to_screen(self, lat, lon):
+        cx, cy = _ll_to_world(self.lat, self.lon, self.z)
+        wx, wy = _ll_to_world(lat, lon, self.z)
+        return (int(self.rect.centerx + (wx - cx)),
+                int(self.rect.centery + (wy - cy)))
 
-    def px_to_world(self, px, py):
-        return [(px - self.rect.centerx) * self.m_per_px,
-                (self.rect.centery - py) * self.m_per_px]
+    def screen_to_ll(self, px, py):
+        cx, cy = _ll_to_world(self.lat, self.lon, self.z)
+        return _world_to_ll(cx + (px - self.rect.centerx),
+                            cy + (py - self.rect.centery), self.z)
 
-    def zoom(self, direction):
-        self.m_per_px = clamp(self.m_per_px * (0.8 if direction > 0 else 1.25),
-                              0.05, 10.0)
+    def zoom_at(self, pos, direction):
+        nz = clamp(self.z + (1 if direction > 0 else -1), 3, 17)
+        if nz == self.z:
+            return
+        anchor = self.screen_to_ll(*pos)      # keep this point under cursor
+        self.z = nz
+        ax, ay = _ll_to_world(*anchor, self.z)
+        self.lat, self.lon = _world_to_ll(
+            ax - (pos[0] - self.rect.centerx),
+            ay - (pos[1] - self.rect.centery), self.z)
+        self.touched = True
 
-    # -- undo plumbing: snapshot before every mutation --
+    # ---- tile machinery ----
+    def _tile_file(self, z, x, y):
+        return os.path.join(ASSET_DIR, "tiles", str(z), str(x), f"{y}.png")
+
+    def _fetcher(self):
+        while True:
+            with self._qlock:
+                key = self._pending.pop() if self._pending else None
+            if key is None:
+                time.sleep(0.05)
+                continue
+            z, x, y = key
+            fp = self._tile_file(z, x, y)
+            try:
+                if not os.path.exists(fp):
+                    req = urllib.request.Request(
+                        TILE_URL.format(z=z, x=x, y=y),
+                        headers={"User-Agent": TILE_UA})
+                    with urllib.request.urlopen(req, timeout=8) as r:
+                        data = r.read()
+                    os.makedirs(os.path.dirname(fp), exist_ok=True)
+                    open(fp, "wb").write(data)
+                    time.sleep(0.05)          # politeness to the tile server
+            except Exception:
+                self._fail[key] = time.time() + 30.0
+
+    def _get_tile(self, z, x, y):
+        n = 1 << z
+        if not (0 <= y < n):
+            return None
+        x %= n
+        key = (z, x, y)
+        surf = self._tiles.get(key)
+        if surf is not None:
+            return surf
+        fp = self._tile_file(z, x, y)
+        if os.path.exists(fp):
+            try:
+                surf = pygame.image.load(fp).convert()
+                if len(self._tiles) > 500:      # simple eviction
+                    self._tiles.clear()
+                self._tiles[key] = surf
+                return surf
+            except Exception:
+                try:
+                    os.remove(fp)               # corrupt/partial download
+                except OSError:
+                    pass
+        if key not in self._fail or time.time() > self._fail.get(key, 0):
+            self._fail.pop(key, None)
+            with self._qlock:
+                self._pending.add(key)
+        return None
+
+    # ---- undo plumbing: snapshot before every mutation ----
     def _push(self):
-        self._history.append([wp.copy() for wp in self.waypoints])
+        self._history.append([dict(wp) for wp in self.waypoints])
         if len(self._history) > 100:
             self._history.pop(0)
 
@@ -451,102 +598,224 @@ class MapView:
         if self._history:
             self.waypoints = self._history.pop()
             self._drag_idx = None
+            if self.sel is not None and self.sel >= len(self.waypoints):
+                self.sel = None
 
     def clear_all(self):
         if self.waypoints:
             self._push()
             self.waypoints = []
+            self.sel = None
+
+    def delete_sel(self):
+        if self.sel is not None and self.sel < len(self.waypoints):
+            self._push()
+            self.waypoints.pop(self.sel)
+            self.sel = None
+
+    def adjust_hold(self, delta):
+        if self.sel is not None and self.sel < len(self.waypoints):
+            self._push()
+            wp = self.waypoints[self.sel]
+            wp["hold"] = clamp(wp.get("hold", 0) + delta, 0, 600)
 
     def _hit(self, pos):
         for i, wp in enumerate(self.waypoints):
-            px, py = self.world_to_px(*wp)
+            px, py = self.ll_to_screen(wp["lat"], wp["lon"])
             if (px - pos[0]) ** 2 + (py - pos[1]) ** 2 <= self.HIT_PX ** 2:
                 return i
         return None
 
-    def mouse_down(self, pos, btn):
+    # ---- mouse ----
+    def mouse_down(self, pos, btn, edit):
         if not self.rect.collidepoint(pos):
             return False
         i = self._hit(pos)
         if btn == 1:
-            self._push()
-            if i is not None:
-                self._drag_idx = i           # grab existing waypoint
+            self._down = pos
+            self._last = pos
+            self._moved = False
+            if edit and i is not None:
+                self._push()
+                self._grab_clean = True
+                self._drag_idx = i
+                self.sel = i
             else:
-                self.waypoints.append(self.px_to_world(*pos))
-        elif btn == 3 and i is not None:
+                self._panning = True
+        elif btn == 3 and edit and i is not None:
             self._push()
             self.waypoints.pop(i)
+            if self.sel is not None:
+                if self.sel == i:
+                    self.sel = None
+                elif self.sel > i:
+                    self.sel -= 1
         return True
 
     def mouse_move(self, pos):
         if self._drag_idx is not None and self._drag_idx < len(self.waypoints):
-            self.waypoints[self._drag_idx] = self.px_to_world(
+            lat, lon = self.screen_to_ll(
                 clamp(pos[0], self.rect.left + 6, self.rect.right - 6),
                 clamp(pos[1], self.rect.top + 6, self.rect.bottom - 6))
+            self.waypoints[self._drag_idx]["lat"] = lat
+            self.waypoints[self._drag_idx]["lon"] = lon
+            self._moved = True
+            self._grab_clean = False
+        elif self._panning and self._last is not None:
+            dx = pos[0] - self._last[0]
+            dy = pos[1] - self._last[1]
+            if dx or dy:
+                cx, cy = _ll_to_world(self.lat, self.lon, self.z)
+                self.lat, self.lon = _world_to_ll(cx - dx, cy - dy, self.z)
+                self._moved = True
+                self.follow = False
+                self.touched = True
+        self._last = pos
 
-    def mouse_up(self):
+    def mouse_up(self, pos, edit):
+        if (edit and self._down is not None and not self._moved
+                and self._drag_idx is None and self._panning):
+            # a clean click on empty map: add a waypoint there
+            lat, lon = self.screen_to_ll(*self._down)
+            self._push()
+            self.waypoints.append({"lat": lat, "lon": lon, "hold": 0})
+            self.sel = len(self.waypoints) - 1
+        if self._grab_clean:
+            # grabbed a waypoint but never moved it: drop the no-op undo entry
+            self._history.pop()
+        self._grab_clean = False
         self._drag_idx = None
+        self._panning = False
+        self._down = None
 
-    def draw(self, surf, nav, target_idx=None):
+    def center_on(self, lat, lon, z=None):
+        self.lat, self.lon = lat, lon
+        if z is not None:
+            self.z = z
+
+    # ---- drawing ----
+    def draw(self, surf, nav, target_idx=None, edit=False):
         r = self.rect
-        panel(surf, r.x, r.y, r.w, r.h, (16, 19, 26))
+        if self.follow and nav.alive and nav.has_fix:
+            self.lat, self.lon = nav.lat, nav.lon
         clip_prev = surf.get_clip()
-        surf.set_clip(r.inflate(-4, -4))
+        surf.set_clip(r)
+        pygame.draw.rect(surf, (16, 19, 26), r)
 
-        step_m = self.m_per_px * 60
-        nice = min((1, 2, 5, 10, 20, 50, 100, 200, 500), key=lambda n: abs(n - step_m))
-        step_px = nice / self.m_per_px
-        ox, oy = self.world_to_px(0, 0)
-        gx = ox % step_px
-        while gx < r.right:
-            if gx > r.left:
-                pygame.draw.line(surf, (26, 31, 41), (gx, r.top), (gx, r.bottom))
-            gx += step_px
-        gy = oy % step_px
-        while gy < r.bottom:
-            if gy > r.top:
-                pygame.draw.line(surf, (26, 31, 41), (r.left, gy), (r.right, gy))
-            gy += step_px
+        # tiles
+        cx, cy = _ll_to_world(self.lat, self.lon, self.z)
+        left_w = cx - r.w / 2
+        top_w = cy - r.h / 2
+        tx0 = int(left_w // TILESIZE)
+        ty0 = int(top_w // TILESIZE)
+        tx1 = int((left_w + r.w) // TILESIZE)
+        ty1 = int((top_w + r.h) // TILESIZE)
+        for tx in range(tx0, tx1 + 1):
+            for ty in range(ty0, ty1 + 1):
+                sx = r.x + int(tx * TILESIZE - left_w)
+                sy = r.y + int(ty * TILESIZE - top_w)
+                t = self._get_tile(self.z, tx, ty)
+                if t is not None:
+                    surf.blit(t, (sx, sy))
+                else:
+                    pygame.draw.rect(surf, (20, 24, 32),
+                                     (sx, sy, TILESIZE, TILESIZE))
+                    pygame.draw.rect(surf, (26, 31, 41),
+                                     (sx, sy, TILESIZE, TILESIZE), width=1)
 
-        hx, hy = self.world_to_px(0, 0)
-        pygame.draw.circle(surf, YELLOW, (hx, hy), 6, width=2)
-        text(surf, "lbl", "HOME", hx, hy - 14, YELLOW, center=True)
+        # PC (this computer) pin — IP geolocation, city precision
+        pc = pc_loc[0]
+        if pc:
+            px, py = self.ll_to_screen(pc["lat"], pc["lon"])
+            if r.collidepoint(px, py):
+                pygame.draw.circle(surf, (180, 120, 255), (px, py), 6)
+                pygame.draw.circle(surf, WHITE, (px, py), 6, width=1)
+                text(surf, "lbl", "PC", px, py - 14, (180, 120, 255), center=True)
 
-        pts = [self.world_to_px(*wp) for wp in self.waypoints]
-        if pts:
-            pygame.draw.lines(surf, (60, 90, 140), False, [(hx, hy)] + pts, 2)
+        # HOME (first GPS fix)
+        if nav.origin:
+            hx, hy = self.ll_to_screen(*nav.origin)
+            pygame.draw.circle(surf, YELLOW, (hx, hy), 6, width=2)
+            text(surf, "lbl", "HOME", hx, hy - 14, YELLOW, center=True)
+
+        # waypoint route
+        pts = [self.ll_to_screen(w["lat"], w["lon"]) for w in self.waypoints]
+        if len(pts) > 1:
+            pygame.draw.lines(surf, (60, 90, 140), False, pts, 2)
         for i, p in enumerate(pts):
             grabbed = (i == self._drag_idx)
+            selected = (i == self.sel and edit)
             active = (i == target_idx)
-            pygame.draw.circle(surf, YELLOW if grabbed else BLUE, p, 9 if grabbed else 7)
-            pygame.draw.circle(surf, WHITE, p, 9 if grabbed else 7, width=1)
+            colr = YELLOW if grabbed else (CYAN if selected else BLUE)
+            pygame.draw.circle(surf, colr, p, 9 if (grabbed or selected) else 7)
+            pygame.draw.circle(surf, WHITE, p, 9 if (grabbed or selected) else 7, width=1)
             if active:
-                pygame.draw.circle(surf, ORANGE, p, 13, width=2)
-            text(surf, "lbl", str(i + 1), p[0], p[1], BG if grabbed else WHITE, center=True)
-        # guidance line: boat -> active target
-        if target_idx is not None and target_idx < len(pts) and nav.trail:
-            bp = self.world_to_px(*nav.trail[-1])
-            pygame.draw.line(surf, ORANGE, bp, pts[target_idx], 2)
+                pygame.draw.circle(surf, ORANGE, p, 14, width=2)
+            text(surf, "lbl", str(i + 1), p[0], p[1],
+                 BG if (grabbed or selected) else WHITE, center=True)
+            hold = self.waypoints[i].get("hold", 0)
+            if hold:
+                text(surf, "lbl", f"{hold:.0f}s", p[0], p[1] + 16, YELLOW, center=True)
 
+        # boat trail + boat
         if len(nav.trail) > 1:
             pygame.draw.lines(surf, (40, 160, 120), False,
-                              [self.world_to_px(*p) for p in nav.trail], 2)
+                              [self.ll_to_screen(*q) for q in nav.trail], 2)
         if nav.alive and nav.has_fix:
-            bx, by = self.world_to_px(*nav.trail[-1]) if nav.trail else (hx, hy)
+            bx, by = self.ll_to_screen(nav.lat, nav.lon)
+            if target_idx is not None and target_idx < len(pts):
+                pygame.draw.line(surf, ORANGE, (bx, by), pts[target_idx], 2)
             hdg = nav.heading if nav.heading is not None else 0
             a = math.radians(hdg - 90)
-            tip = (bx + int(math.cos(a) * 12), by + int(math.sin(a) * 12))
-            l = (bx + int(math.cos(a + 2.5) * 9), by + int(math.sin(a + 2.5) * 9))
-            rr = (bx + int(math.cos(a - 2.5) * 9), by + int(math.sin(a - 2.5) * 9))
-            pygame.draw.polygon(surf, CYAN, (tip, l, rr))
-        else:
-            text(surf, "med", "NO GPS — planning grid",
-                 r.centerx, r.top + 20, DIM, center=True)
+            tip = (bx + int(math.cos(a) * 13), by + int(math.sin(a) * 13))
+            lft = (bx + int(math.cos(a + 2.5) * 9), by + int(math.sin(a + 2.5) * 9))
+            rgt = (bx + int(math.cos(a - 2.5) * 9), by + int(math.sin(a - 2.5) * 9))
+            pygame.draw.polygon(surf, CYAN, (tip, lft, rgt))
+            pygame.draw.polygon(surf, BG, (tip, lft, rgt), width=1)
 
-        text(surf, "lbl", f"grid {nice} m   scroll = zoom",
-             r.left + 12, r.bottom - 22, GREY)
+        # edit-mode overlay: banner + ArduPilot-style waypoint table
+        if edit:
+            pygame.draw.rect(surf, ORANGE, r, width=2)
+            pygame.draw.rect(surf, (40, 30, 14), (r.x + 2, r.y + 2, 170, 26))
+            text(surf, "med", "EDIT MODE", r.x + 12, r.y + 7, ORANGE)
+            if self.waypoints:
+                rows = min(len(self.waypoints), 14)
+                th = 20 * rows + 30
+                ov = pygame.Surface((190, th), pygame.SRCALPHA)
+                ov.fill((14, 17, 23, 225))
+                surf.blit(ov, (r.x + 2, r.y + 32))
+                text(surf, "lbl", " #    LEG    HOLD", r.x + 12, r.y + 38, GREY)
+                prev = None
+                total = 0.0
+                for i, w in enumerate(self.waypoints):
+                    if prev is not None:
+                        d, _ = geo_dist_bearing(prev["lat"], prev["lon"],
+                                                w["lat"], w["lon"])
+                        total += d
+                    else:
+                        d = 0.0
+                    if i < rows:
+                        ycol = CYAN if i == self.sel else WHITE
+                        text(surf, "sm",
+                             f"{i+1:>2}  {d:>5.0f}m  {w.get('hold',0):>3.0f}s",
+                             r.x + 12, r.y + 54 + 20 * i, ycol)
+                    prev = w
+                text(surf, "lbl", f"route {total:.0f}m",
+                     r.x + 12, r.y + 40 + 20 * rows + 14, GREY)
+
+        # HUD line: zoom + scale + follow state + attribution
+        mpp = 40075016.7 * math.cos(math.radians(self.lat)) / ((1 << self.z) * TILESIZE)
+        text(surf, "lbl",
+             f"z{self.z}  {mpp * 100:.0f}m/100px   "
+             f"{'FOLLOW' if self.follow else 'free pan (F=follow)'}",
+             r.left + 10, r.bottom - 20, GREY)
+        text(surf, "lbl", "(c) OpenStreetMap", r.right - 118, r.bottom - 20, GREY)
+        if not (nav.alive and nav.has_fix):
+            text(surf, "lbl", "NO GPS — boat position unknown",
+                 r.centerx, r.top + 12, ORANGE, center=True)
+
         surf.set_clip(clip_prev)
+        pygame.draw.rect(surf, OUTLINE, r, width=1, border_radius=2)
 
 
 class Boat3D:
@@ -766,7 +1035,13 @@ def main():
     )
 
     nav = Nav()
-    mapview = MapView((472, 96, 610, 580))
+    threading.Thread(target=_pc_locator, daemon=True).start()
+    pc_cached = load_pc_cache()
+    if pc_cached:
+        map_center, map_zoom = (pc_cached["lat"], pc_cached["lon"]), 12
+    else:
+        map_center, map_zoom = PH_CENTER, 6
+    mapview = MapView((472, 96, 610, 580), map_center, map_zoom)
     boat3d = Boat3D((1098, 400, 478, 330))
     cam_rect = (1098, 96, 478, 292)
 
@@ -774,7 +1049,9 @@ def main():
     speed = 1.0
     motors_on = False              # SAFETY: always start disarmed
     mode = "TELEOP"                # "TELEOP" | "AUTO"
+    edit_mode = False              # keyboard E only — mission editing
     wp_index = 0
+    hold_until = 0.0
     auto_info = ""
     winch_cmd = 90
     w_cmd = 90
@@ -801,17 +1078,18 @@ def main():
 
     def auto_ready():
         return (motors_on and connected and mapview.waypoints
-                and nav.alive and nav.has_fix and nav.heading is not None
-                and len(nav.trail) > 0)
+                and not edit_mode
+                and nav.alive and nav.has_fix and nav.heading is not None)
 
     def toggle_mode():
-        nonlocal mode, wp_index, auto_info
+        nonlocal mode, wp_index, auto_info, hold_until
         if mode == "AUTO":
             mode = "TELEOP"
             auto_info = ""
         elif auto_ready():
             mode = "AUTO"
             wp_index = 0
+            hold_until = 0.0
             auto_info = "engaging"
 
     while running:
@@ -839,16 +1117,30 @@ def main():
                     motors_on = not motors_on
                 elif e.key == pygame.K_m:
                     toggle_mode()
+                elif e.key == pygame.K_e:
+                    edit_mode = not edit_mode
+                    if edit_mode and mode == "AUTO":
+                        mode = "TELEOP"       # editing and AUTO don't mix
+                    if not edit_mode:
+                        mapview.sel = None
+                elif e.key == pygame.K_f:
+                    mapview.follow = True
                 elif e.key == pygame.K_c:
                     mapview.clear_all()
                     mode = "TELEOP"
+                elif e.key == pygame.K_DELETE and edit_mode:
+                    mapview.delete_sel()
+                elif e.key == pygame.K_LEFTBRACKET and edit_mode:
+                    mapview.adjust_hold(-HOLD_STEP_S)
+                elif e.key == pygame.K_RIGHTBRACKET and edit_mode:
+                    mapview.adjust_hold(+HOLD_STEP_S)
                 elif e.key == pygame.K_z and (e.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)):
                     mapview.undo()
             elif e.type == pygame.MOUSEBUTTONDOWN:
                 cpos = to_canvas(e.pos)
                 if e.button in (4, 5):
                     if mapview.rect.collidepoint(cpos):
-                        mapview.zoom(1 if e.button == 4 else -1)
+                        mapview.zoom_at(cpos, 1 if e.button == 4 else -1)
                 elif e.button == 1 and boat3d.mouse_down(cpos):
                     pass
                 elif btn_start.collidepoint(cpos):
@@ -857,10 +1149,10 @@ def main():
                     mapview.clear_all()
                     mode = "TELEOP"
                 else:
-                    mapview.mouse_down(cpos, e.button)
+                    mapview.mouse_down(cpos, e.button, edit_mode)
             elif e.type == pygame.MOUSEBUTTONUP:
                 boat3d.mouse_up()
-                mapview.mouse_up()
+                mapview.mouse_up(to_canvas(e.pos), edit_mode)
             elif e.type == pygame.MOUSEMOTION:
                 cpos = to_canvas(e.pos)
                 boat3d.mouse_move(cpos)
@@ -868,7 +1160,7 @@ def main():
             elif e.type == pygame.MOUSEWHEEL:
                 cpos = to_canvas(pygame.mouse.get_pos())
                 if mapview.rect.collidepoint(cpos):
-                    mapview.zoom(e.y)
+                    mapview.zoom_at(cpos, e.y)
 
         try:
             count = pygame.joystick.get_count()
@@ -936,12 +1228,13 @@ def main():
                     mode = "TELEOP"       # pilot grabbed the sticks
                     auto_info = "stick override"
                 elif not (nav.alive and nav.has_fix and nav.heading is not None
-                          and nav.trail and wp_index < len(mapview.waypoints)):
+                          and wp_index < len(mapview.waypoints)):
                     left_cmd = right_cmd = 90   # telemetry lost: hold neutral
                     auto_info = "AUTO PAUSED — no telemetry"
                 else:
-                    left_cmd, right_cmd, wp_index, done, auto_info = \
-                        autopilot_step(nav, mapview.waypoints, wp_index, speed)
+                    left_cmd, right_cmd, wp_index, hold_until, done, auto_info = \
+                        autopilot_step(nav, mapview.waypoints, wp_index, speed,
+                                       hold_until, time.time())
                     if done:
                         mode = "TELEOP"
         else:
@@ -1023,10 +1316,14 @@ def main():
                  24, 664, ORANGE)
 
         # -- middle column: navigation --
+        # first successful geolocation: recenter an untouched overview map
+        if pc_loc[0] and not mapview.touched and mapview.z <= 6 and not nav.has_fix:
+            mapview.center_on(pc_loc[0]["lat"], pc_loc[0]["lon"], 12)
         text(canvas, "lbl", "NAVIGATION", 472, 74, GREY)
         mapview.draw(canvas, nav,
                      wp_index if mode == "AUTO" and wp_index < len(mapview.waypoints)
-                     else None)
+                     else None,
+                     edit_mode)
         if mode == "AUTO":
             text(canvas, "med", "AUTO", mapview.rect.right - 46,
                  mapview.rect.top + 20, ORANGE, center=True)
@@ -1037,8 +1334,9 @@ def main():
         in_auto = (mode == "AUTO")
         # mode chip
         pygame.draw.rect(canvas, PANEL2, (482, bar_y + 6, 118, 32), border_radius=8)
-        text(canvas, "med", mode, 482 + 59, bar_y + 22,
-             ORANGE if in_auto else BLUE, center=True)
+        chip = "EDIT" if edit_mode else mode
+        text(canvas, "med", chip, 482 + 59, bar_y + 22,
+             CYAN if edit_mode else (ORANGE if in_auto else BLUE), center=True)
         text(canvas, "med", f"WP: {wp_n}", 616, bar_y + 13, WHITE)
         btn_start = button(canvas, (688, bar_y + 6, 156, 32),
                            "STOP AUTO (M)" if in_auto else "START AUTO (M)",
@@ -1049,6 +1347,7 @@ def main():
             text(canvas, "lbl", auto_info, 966, bar_y + 17, ORANGE)
         elif not auto_ready():
             need = "needs: "
+            if edit_mode: need += "exit EDIT (E) "
             if not motors_on: need += "ARM "
             if not connected: need += "controller "
             if not (nav.alive and nav.has_fix): need += "GPS "
@@ -1086,9 +1385,9 @@ def main():
              1112, 768, GREY)
 
         text(canvas, "sm",
-             "SQUARE|SPACE arm   M auto/teleop (sticks always override)   "
-             "L1/R1|Arrows speed   TRI/O/X winch   "
-             "map: click add / drag move / r-click del / Ctrl+Z undo   F11",
+             "SPACE arm   M auto/teleop (sticks override)   E edit mode   "
+             "F follow boat   edit: click add/select, drag move, r-click del, "
+             "[ ] hold time, DEL delete, Ctrl+Z undo   F11",
              24, H - 26, GREY)
 
         # ---- letterbox scale to window ----
