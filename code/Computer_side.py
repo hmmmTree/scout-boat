@@ -121,6 +121,49 @@ def save_settings():
         pass
 
 
+# ---- Mission Planner interop: QGC WPL 110 .waypoints files ----
+def load_waypoints_file(path):
+    """Parse a Mission Planner / QGC .waypoints file into our waypoint dicts.
+
+    Rows: seq current frame command p1..p4 lat lon alt autocontinue.
+    NAV_WAYPOINT (16) rows become waypoints; p1 (delay) maps to our hold.
+    Row 0 is the home position and is skipped.
+    """
+    wps = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        header = f.readline()
+        if not header.startswith("QGC WPL"):
+            raise ValueError("not a QGC WPL waypoints file")
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 12:
+                continue
+            try:
+                seq, cmd = int(parts[0]), int(parts[3])
+                p1 = float(parts[4])
+                lat, lon = float(parts[8]), float(parts[9])
+            except ValueError:
+                continue
+            if seq == 0 or cmd != 16:
+                continue
+            if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+                continue
+            wps.append({"lat": lat, "lon": lon,
+                        "hold": clamp(p1, 0, 600), "wa": "none", "ws": 5})
+    return wps
+
+
+def save_waypoints_file(path, waypoints, home=None):
+    """Write our mission as QGC WPL 110 so Mission Planner can open it."""
+    h = home or (waypoints[0] if waypoints else {"lat": 0.0, "lon": 0.0})
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("QGC WPL 110\n")
+        f.write(f"0\t1\t0\t16\t0\t0\t0\t0\t{h['lat']:.7f}\t{h['lon']:.7f}\t0\t1\n")
+        for i, w in enumerate(waypoints, start=1):
+            f.write(f"{i}\t0\t3\t16\t{w.get('hold', 0):.1f}\t0\t0\t0\t"
+                    f"{w['lat']:.7f}\t{w['lon']:.7f}\t0\t1\n")
+
+
 # ---- computer location (IP geolocation, city precision; cached offline) ----
 pc_loc = [None]
 
@@ -1343,6 +1386,11 @@ def main():
         ("Shift+0", "clear heading + attitude calibration"),
         ("S", "settings: invert heading / roll / pitch direction"),
         ("H", "this panel"),
+        ("", ""),
+        ("MISSION PLANNER", ""),
+        ("drag & drop", "a .waypoints file onto this window loads the mission"),
+        ("Ctrl+S", "save mission as .waypoints (assets/missions/)"),
+        ("", "plan in Mission Planner's map -> save -> drop here -> AUTO"),
         ("F11 / ESC", "fullscreen / leave fullscreen or quit"),
         ("", ""),
         ("EDIT MODE (keyboard E)", ""),
@@ -1420,6 +1468,27 @@ def main():
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 running = False
+            elif e.type == pygame.DROPFILE:
+                # Mission Planner interop: drop a .waypoints file to load it
+                try:
+                    wps = load_waypoints_file(e.file)
+                    if wps:
+                        mapview._push()
+                        mapview.waypoints = wps
+                        mapview.sel = None
+                        mode = "TELEOP"
+                        mapview.center_on(wps[0]["lat"], wps[0]["lon"],
+                                          max(mapview.z, 15))
+                        mapview.follow = False
+                        cal_toast = (f"mission loaded: {len(wps)} waypoints "
+                                     f"from {os.path.basename(e.file)}",
+                                     time.time())
+                    else:
+                        cal_toast = ("no waypoints found in that file",
+                                     time.time())
+                except Exception as ex:
+                    cal_toast = (f"could not read mission file: {ex}",
+                                 time.time())
             elif e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_F11:
                     fullscreen = not fullscreen
@@ -1439,7 +1508,7 @@ def main():
                 elif e.key == pygame.K_h:
                     help_open = not help_open
                     help_scroll = 0
-                elif e.key == pygame.K_s:
+                elif e.key == pygame.K_s and not (e.mod & pygame.KMOD_CTRL):
                     settings_open = not settings_open
                 elif settings_open and e.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                     k = {pygame.K_1: "invert_hdg", pygame.K_2: "invert_roll",
@@ -1477,6 +1546,19 @@ def main():
                     mapview.follow = True
                 elif e.key == pygame.K_p:
                     center_pc()
+                elif e.key == pygame.K_s and (e.mod & pygame.KMOD_CTRL):
+                    if mapview.waypoints:
+                        mdir = os.path.join(ASSET_DIR, "missions")
+                        os.makedirs(mdir, exist_ok=True)
+                        stamp = time.strftime("%Y%m%d_%H%M%S")
+                        fp = os.path.join(mdir, f"mission_{stamp}.waypoints")
+                        try:
+                            save_waypoints_file(fp, mapview.waypoints)
+                            cal_toast = (f"mission saved: {fp}", time.time())
+                        except Exception as ex:
+                            cal_toast = (f"save failed: {ex}", time.time())
+                    else:
+                        cal_toast = ("no waypoints to save", time.time())
                 elif e.key in (pygame.K_0, pygame.K_KP0):
                     link_up = time.time() - net["last_ack"] < 1.0
                     if e.mod & pygame.KMOD_SHIFT:
