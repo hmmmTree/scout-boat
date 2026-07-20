@@ -28,7 +28,10 @@ frames arrive.
 Windows note: "No internet" on the BoatControl network is normal — the boat
 is an access point with no internet behind it.
 
-Requires: pygame-ce (or pygame), numpy.
+Requires: pygame-ce (or pygame), numpy. Optional: pyserial for the wired
+USB link — if the boat is plugged in and WiFi is silent for 2s, commands
+switch to the USB cable automatically (BOAT LINK pill shows "USB");
+unplugging falls back to WiFi. Same protocol either way.
 The 3D view loads assets/boat_mesh.npz — converted from "Twin v2.step".
 """
 import io
@@ -238,33 +241,111 @@ def _camera_thread():
 # Runs in its own thread so the packet rate NEVER depends on GUI frame
 # rate (the 3D render or a slow frame must not starve the boat of
 # commands — the boat failsafes after 300ms of silence).
+#
+# Transports: WiFi UDP by default; if no acks arrive for 2s and a boat
+# is plugged in over USB (CP210x/CH340 serial), the worker switches to
+# the cable — same protocol, one line per command. Unplugging falls
+# back to WiFi automatically. net["transport"] says which is active.
+def _find_boat_port():
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return None
+    for p in list_ports.comports():
+        desc = (p.description or "").upper()
+        if p.vid in (0x10C4, 0x1A86) or "CP210" in desc or "CH340" in desc \
+                or "USB-SERIAL" in desc:
+            return p.device
+    return None
+
+
 def _net_worker(sock, net, nav):
+    try:
+        import serial as pyserial
+    except ImportError:
+        pyserial = None
+    ser = None
+    sbuf = b""
+    last_ser_try = 0.0
+    ser_opened_at = 0.0
     period = 1.0 / SEND_HZ
     next_t = time.perf_counter()
     while net["run"]:
         next_t += period
         l, r, w, en = net["cmd"]
-        try:
-            sock.sendto(f"L:{l},R:{r},W:{w},E:{en}".encode(),
-                        (ESP32_IP, ESP32_PORT))
-        except OSError:
-            pass
-        try:
-            while True:
-                data, _ = sock.recvfrom(160)
-                if data:
-                    net["last_ack"] = time.time()
-                    net["ack_count"] += 1
-                    parse_ack(data, nav)
-        except OSError:
-            pass
-        # absolute deadline: GIL waits inside a cycle shorten the next
-        # sleep instead of stretching every cycle
+        msg = f"L:{l},R:{r},W:{w},E:{en}".encode()
+
+        if ser is not None:
+            try:
+                ser.write(msg + b"\n")
+                if ser.in_waiting:
+                    sbuf += ser.read(ser.in_waiting)
+                    while b"\n" in sbuf:
+                        line, sbuf = sbuf.split(b"\n", 1)
+                        line = line.strip()
+                        if line.startswith(b"OK"):
+                            net["last_ack"] = time.time()
+                            net["ack_count"] += 1
+                            parse_ack(line, nav)
+                if len(sbuf) > 4096:
+                    sbuf = b""
+                # cable present but boat not answering (old firmware or
+                # wrong device): give the port back and return to WiFi
+                if time.time() - max(net["last_ack"], ser_opened_at) > 3.0:
+                    raise OSError("no acks over USB")
+            except Exception:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+                net["transport"] = "WiFi"
+        else:
+            try:
+                sock.sendto(msg, (ESP32_IP, ESP32_PORT))
+            except OSError:
+                pass
+            try:
+                while True:
+                    data, _ = sock.recvfrom(160)
+                    if data:
+                        net["last_ack"] = time.time()
+                        net["ack_count"] += 1
+                        parse_ack(data, nav)
+            except OSError:
+                pass
+            # WiFi silent and a USB boat present? switch to the cable.
+            now = time.time()
+            if (pyserial and now - net["last_ack"] > 2.0
+                    and now - last_ser_try > 3.0):
+                last_ser_try = now
+                port = _find_boat_port()
+                if port:
+                    try:
+                        s = pyserial.Serial()
+                        s.port = port
+                        s.baudrate = 115200
+                        s.timeout = 0
+                        s.dtr = False       # avoid resetting the ESP32
+                        s.rts = False
+                        s.open()
+                        ser = s
+                        sbuf = b""
+                        ser_opened_at = time.time()
+                        net["transport"] = "USB"
+                    except Exception:
+                        ser = None
+
         left = next_t - time.perf_counter()
         if left > 0:
             time.sleep(left)
         elif left < -period * 4:
             next_t = time.perf_counter()   # fell far behind; resync
+    if ser is not None:
+        try:
+            ser.close()
+        except Exception:
+            pass
 
 
 # ---- GPS / IMU state (filled by T: telemetry from the boat) ----
@@ -279,6 +360,12 @@ class Nav:
         self.origin = None
         self.trail = deque(maxlen=3000)
         self.last_update = 0.0
+        # feed() runs on the network thread, drawing on the GUI thread
+        self._lock = threading.Lock()
+
+    def trail_points(self):
+        with self._lock:
+            return list(self.trail)
 
     def feed(self, lat, lon, heading, sats, speed=None, pitch=None, roll=None):
         self.lat, self.lon, self.sats = lat, lon, sats
@@ -290,7 +377,8 @@ class Nav:
         if self.has_fix:
             if self.origin is None:
                 self.origin = (lat, lon)
-            self.trail.append((lat, lon))       # geographic trail
+            with self._lock:
+                self.trail.append((lat, lon))   # geographic trail
 
     def to_local(self, lat, lon):
         if self.origin is None:
@@ -833,9 +921,10 @@ class MapView:
                      p[1] + (30 if hold else 16), wcol, center=True)
 
         # boat trail + boat
-        if len(nav.trail) > 1:
+        trail = nav.trail_points()
+        if len(trail) > 1:
             pygame.draw.lines(surf, (40, 160, 120), False,
-                              [self.ll_to_screen(*q) for q in nav.trail], 2)
+                              [self.ll_to_screen(*q) for q in trail], 2)
         if nav.alive and nav.has_fix:
             bx, by = self.ll_to_screen(nav.lat, nav.lon)
             if target_idx is not None and target_idx < len(pts):
@@ -1193,7 +1282,8 @@ def main():
     running = True
     connected = False
 
-    net = {"run": True, "cmd": (90, 90, 90, 0), "last_ack": 0.0, "ack_count": 0}
+    net = {"run": True, "cmd": (90, 90, 90, 0), "last_ack": 0.0,
+           "ack_count": 0, "transport": "WiFi"}
     threading.Thread(target=_net_worker, args=(sock, net, nav), daemon=True).start()
 
     def to_canvas(pos):
@@ -1483,7 +1573,7 @@ def main():
                  "OK" if connected else "NOT FOUND")
             pill(canvas, 240, 96, 208, 42, "WIFI", on_boat_wifi, wifi_detail)
             pill(canvas, 24, 146, 208, 42, "BOAT LINK", boat_ok,
-                 f"OK {int(age*1000)}ms" if boat_ok else "LOST")
+                 f"{net['transport']} {int(age*1000)}ms" if boat_ok else "LOST")
             pill(canvas, 240, 146, 208, 42, "GPS",
                  nav.alive and nav.has_fix,
                  f"{nav.sats} SATS" if (nav.alive and nav.has_fix) else "NO FIX")
@@ -1523,9 +1613,13 @@ def main():
                         accent=ORANGE if winch_cmd == 0 else BLUE), 0),
             ]
 
-            if not on_boat_wifi:
+            if net["transport"] == "USB" and boat_ok:
+                text(canvas, "sm", "Wired to the boat over USB — WiFi not needed.",
+                     24, 664, CYAN)
+            elif not on_boat_wifi:
                 text(canvas, "sm",
-                     f'Join WiFi "{BOAT_SSID}" — "No internet" there is normal.',
+                     f'Join WiFi "{BOAT_SSID}" — or plug the boat in over USB. '
+                     '("No internet" on boat WiFi is normal.)',
                      24, 664, ORANGE)
             elif not boat_ok:
                 text(canvas, "sm", "On boat WiFi but no reply — boat powered?",

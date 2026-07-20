@@ -272,8 +272,68 @@ void updateTelemetry() {
 #endif
 }
 
+void buildAck(char* out, size_t n) {
+  if (telHaveFix || telHaveHdg) {
+    snprintf(out, n, "OK T:%.6f,%.6f,%.1f,%d,%.2f,%.1f,%.1f",
+             telHaveFix ? telLat : 0.0f, telHaveFix ? telLon : 0.0f,
+             telHaveHdg ? telHdg : 0.0f, telHaveFix ? telSats : 0,
+             telHaveFix ? telSpd : 0.0f, telPitch, telRoll);
+  } else {
+    snprintf(out, n, "OK");
+  }
+}
+
+// Same protocol over WiFi UDP or the USB serial cable. Acks return on
+// whichever transport the command arrived on.
+void handleCommand(const char* buf, bool fromSerial) {
+  int l, r, w, en = 1;
+  int n = sscanf(buf, "L:%d,R:%d,W:%d,E:%d", &l, &r, &w, &en);
+  if (n < 3) return;
+  if (n < 4) en = 1;                 // old senders without E: = enabled
+  lastPacketMs = millis();
+
+  if (en) {
+    targetL = constrain(l, 0, 180);
+    targetR = constrain(r, 0, 180);
+    targetW = constrain(w, 0, 180);
+    stopped = false;
+  } else {
+    hardStop();                      // disarmed: everything off NOW, no ramp
+    stopped = true;
+  }
+
+  char ack[112];
+  buildAck(ack, sizeof(ack));
+  if (fromSerial) {
+    Serial.println(ack);
+  } else {
+    udp.beginPacket(udp.remoteIP(), udp.remotePort());
+    udp.print(ack);
+    udp.endPacket();
+  }
+}
+
+char usbBuf[64];
+uint8_t usbLen = 0;
+
 void loop() {
   updateTelemetry();
+
+  // ---- wired link: same commands arriving over USB serial ----
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (usbLen) {
+        usbBuf[usbLen] = '\0';
+        handleCommand(usbBuf, true);
+        usbLen = 0;
+      }
+    } else if (usbLen < sizeof(usbBuf) - 1) {
+      usbBuf[usbLen++] = c;
+    } else {
+      usbLen = 0;                    // garbage line too long: drop it
+    }
+  }
 
   // periodic health line so the serial monitor doubles as a sensor check
   if (millis() - lastStatusMs >= 5000) {
@@ -303,36 +363,7 @@ void loop() {
     int len = udp.read(packetBuf, sizeof(packetBuf) - 1);
     if (len > 0) packetBuf[len] = '\0';
 
-    int l, r, w, en = 1;
-    int n = sscanf(packetBuf, "L:%d,R:%d,W:%d,E:%d", &l, &r, &w, &en);
-    if (n >= 3) {
-      if (n < 4) en = 1;               // old senders without E: = enabled
-      lastPacketMs = millis();
-
-      if (en) {
-        targetL = constrain(l, 0, 180);
-        targetR = constrain(r, 0, 180);
-        targetW = constrain(w, 0, 180);
-        stopped = false;
-      } else {
-        hardStop();                    // disarmed: everything off NOW, no ramp
-        stopped = true;
-      }
-
-      // Acknowledge so the PC knows the link is alive (with telemetry if any)
-      udp.beginPacket(udp.remoteIP(), udp.remotePort());
-      if (telHaveFix || telHaveHdg) {
-        char ack[112];
-        snprintf(ack, sizeof(ack), "OK T:%.6f,%.6f,%.1f,%d,%.2f,%.1f,%.1f",
-                 telHaveFix ? telLat : 0.0f, telHaveFix ? telLon : 0.0f,
-                 telHaveHdg ? telHdg : 0.0f, telHaveFix ? telSats : 0,
-                 telHaveFix ? telSpd : 0.0f, telPitch, telRoll);
-        udp.print(ack);
-      } else {
-        udp.print("OK");
-      }
-      udp.endPacket();
-    }
+    handleCommand(packetBuf, false);
   }
 
   // ---- ramp the outputs toward the targets ----
