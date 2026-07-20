@@ -201,6 +201,18 @@ void setup() {
 #if USE_IMU
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
+  // scan the whole bus first - tells wiring problems from address problems
+  Serial.print("I2C scan:");
+  int i2cFound = 0;
+  for (byte a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf(" 0x%02X", a);
+      i2cFound++;
+    }
+  }
+  if (!i2cFound) Serial.print(" NOTHING - check wiring/solder joints");
+  Serial.println();
   imu.begin(Wire, 1);                    // try addr 0x69 (AD0 high)
   if (imu.status != ICM_20948_Stat_Ok) imu.begin(Wire, 0);   // then 0x68
   imuOk = (imu.status == ICM_20948_Stat_Ok);
