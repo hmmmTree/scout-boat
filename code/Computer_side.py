@@ -4,7 +4,8 @@ Keys / controls:
   F11        fullscreen toggle          SPACE / Square   arm-disarm
   Arrows or L1/R1  speed limit          ESC              exit fullscreen / quit
   TRI/O/X    winch in/stop/out          C                clear waypoints
-  Map: left-click add waypoint, right-click delete last, scroll zoom
+  Map: click = add waypoint, drag one = move it, right-click one = delete,
+       Ctrl+Z = undo, C = clear all, scroll = zoom
   3D view: drag to orbit
 
 Network protocol (UDP to 192.168.4.1:4210):
@@ -30,6 +31,7 @@ import math
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -37,6 +39,10 @@ from collections import deque
 
 import numpy as np
 import pygame
+
+# Give the 50Hz network thread timely GIL slices even while the 3D
+# renderer is busy (default switch interval is 5ms, too coarse here).
+sys.setswitchinterval(0.001)
 
 ESP32_IP   = "192.168.4.1"
 ESP32_PORT = 4210
@@ -150,6 +156,39 @@ def _camera_thread():
             cam_frame[0] = None
             cam_status[0] = "no camera"
             time.sleep(5)
+
+
+# ---- network worker: fixed 50Hz command send + ack drain ----
+# Runs in its own thread so the packet rate NEVER depends on GUI frame
+# rate (the 3D render or a slow frame must not starve the boat of
+# commands — the boat failsafes after 300ms of silence).
+def _net_worker(sock, net, nav):
+    period = 1.0 / SEND_HZ
+    next_t = time.perf_counter()
+    while net["run"]:
+        next_t += period
+        l, r, w, en = net["cmd"]
+        try:
+            sock.sendto(f"L:{l},R:{r},W:{w},E:{en}".encode(),
+                        (ESP32_IP, ESP32_PORT))
+        except OSError:
+            pass
+        try:
+            while True:
+                data, _ = sock.recvfrom(160)
+                if data:
+                    net["last_ack"] = time.time()
+                    net["ack_count"] += 1
+                    parse_ack(data, nav)
+        except OSError:
+            pass
+        # absolute deadline: GIL waits inside a cycle shorten the next
+        # sleep instead of stretching every cycle
+        left = next_t - time.perf_counter()
+        if left > 0:
+            time.sleep(left)
+        elif left < -period * 4:
+            next_t = time.perf_counter()   # fell far behind; resync
 
 
 # ---- GPS / IMU state (filled by T: telemetry from the boat) ----
@@ -335,33 +374,79 @@ def compass(surf, x, y, size, heading):
 
 
 class MapView:
-    """Local-frame map: meters relative to first GPS fix."""
+    """Local-frame map: meters relative to first GPS fix.
+
+    Waypoint editing: click empty water = add, drag a waypoint = move it,
+    right-click a waypoint = delete it, Ctrl+Z = undo any of the above.
+    """
+
+    HIT_PX = 13
 
     def __init__(self, rect):
         self.rect = pygame.Rect(rect)
         self.m_per_px = 0.5
-        self.waypoints = []
+        self.waypoints = []          # [[x_m, y_m], ...]
+        self._history = []
+        self._drag_idx = None
 
     def world_to_px(self, wx, wy):
         return (int(self.rect.centerx + wx / self.m_per_px),
                 int(self.rect.centery - wy / self.m_per_px))
 
     def px_to_world(self, px, py):
-        return ((px - self.rect.centerx) * self.m_per_px,
-                (self.rect.centery - py) * self.m_per_px)
+        return [(px - self.rect.centerx) * self.m_per_px,
+                (self.rect.centery - py) * self.m_per_px]
 
     def zoom(self, direction):
         self.m_per_px = clamp(self.m_per_px * (0.8 if direction > 0 else 1.25),
                               0.05, 10.0)
 
-    def click(self, pos, btn):
+    # -- undo plumbing: snapshot before every mutation --
+    def _push(self):
+        self._history.append([wp.copy() for wp in self.waypoints])
+        if len(self._history) > 100:
+            self._history.pop(0)
+
+    def undo(self):
+        if self._history:
+            self.waypoints = self._history.pop()
+            self._drag_idx = None
+
+    def clear_all(self):
+        if self.waypoints:
+            self._push()
+            self.waypoints = []
+
+    def _hit(self, pos):
+        for i, wp in enumerate(self.waypoints):
+            px, py = self.world_to_px(*wp)
+            if (px - pos[0]) ** 2 + (py - pos[1]) ** 2 <= self.HIT_PX ** 2:
+                return i
+        return None
+
+    def mouse_down(self, pos, btn):
         if not self.rect.collidepoint(pos):
             return False
+        i = self._hit(pos)
         if btn == 1:
-            self.waypoints.append(self.px_to_world(*pos))
-        elif btn == 3 and self.waypoints:
-            self.waypoints.pop()
+            self._push()
+            if i is not None:
+                self._drag_idx = i           # grab existing waypoint
+            else:
+                self.waypoints.append(self.px_to_world(*pos))
+        elif btn == 3 and i is not None:
+            self._push()
+            self.waypoints.pop(i)
         return True
+
+    def mouse_move(self, pos):
+        if self._drag_idx is not None and self._drag_idx < len(self.waypoints):
+            self.waypoints[self._drag_idx] = self.px_to_world(
+                clamp(pos[0], self.rect.left + 6, self.rect.right - 6),
+                clamp(pos[1], self.rect.top + 6, self.rect.bottom - 6))
+
+    def mouse_up(self):
+        self._drag_idx = None
 
     def draw(self, surf, nav):
         r = self.rect
@@ -392,9 +477,10 @@ class MapView:
         if pts:
             pygame.draw.lines(surf, (60, 90, 140), False, [(hx, hy)] + pts, 2)
         for i, p in enumerate(pts):
-            pygame.draw.circle(surf, BLUE, p, 7)
-            pygame.draw.circle(surf, WHITE, p, 7, width=1)
-            text(surf, "lbl", str(i + 1), p[0], p[1], WHITE, center=True)
+            grabbed = (i == self._drag_idx)
+            pygame.draw.circle(surf, YELLOW if grabbed else BLUE, p, 9 if grabbed else 7)
+            pygame.draw.circle(surf, WHITE, p, 9 if grabbed else 7, width=1)
+            text(surf, "lbl", str(i + 1), p[0], p[1], BG if grabbed else WHITE, center=True)
 
         if len(nav.trail) > 1:
             pygame.draw.lines(surf, (40, 160, 120), False,
@@ -435,6 +521,14 @@ class Boat3D:
                 self.verts = d["verts"]
                 self.faces = d["faces"]
                 self.normals = d["normals"]
+                self.edges = d["edges"]        # (E,2) vertex ids
+                self.eadj = d["eadj"]          # (E,2) adjacent face ids (-1 = none)
+                self.ecrease = d["ecrease"]    # (E,) bool: sharp/boundary edge
+                # per-face edge ids (uniq is lexicographically sorted, so
+                # rebuilding with np.unique reproduces the same edge order)
+                e = np.sort(self.faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+                _, inv = np.unique(e, axis=0, return_inverse=True)
+                self.face_edges = inv.reshape(-1, 3)
                 self.ok = True
                 break
         self.view_yaw = 0.0        # user orbit offset
@@ -442,8 +536,31 @@ class Boat3D:
         self.dragging = False
         self.last_mouse = (0, 0)
         self.idle = 0.0
+        # rendering happens on a worker thread (a full render takes ~30ms,
+        # which would drag the 50Hz control loop down to ~15Hz otherwise)
         self.cache = None
-        self.cache_key = None
+        self._want = None
+        self._done = None
+        self._lock = threading.Lock()
+        if self.ok:
+            threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        while True:
+            with self._lock:
+                want = self._want
+                done = self._done
+            if want is None or want == done:
+                time.sleep(0.01)
+                continue
+            t0 = time.perf_counter()
+            surf = self._render(*want)
+            with self._lock:
+                self.cache = surf
+                self._done = want
+            # cap render rate so this thread leaves the GIL mostly free
+            # for the control loop
+            time.sleep(max(0.02, 0.15 - (time.perf_counter() - t0)))
 
     def mouse_down(self, pos):
         if self.rect.collidepoint(pos):
@@ -480,12 +597,12 @@ class Boat3D:
             self.idle = (self.idle + dt * 12.0) % 360
             yaw, pitch, roll = self.idle, 0.0, 0.0
 
-        key = (round(yaw, 1), round(pitch, 1), round(roll, 1),
-               round(self.view_yaw, 1), round(self.view_pitch, 1))
-        if key != self.cache_key or self.cache is None:
-            self.cache = self._render(r.w, r.h, yaw, pitch, roll)
-            self.cache_key = key
-        surf.blit(self.cache, (r.x, r.y))
+        with self._lock:
+            self._want = (r.w, r.h, round(yaw), round(pitch), round(roll),
+                          round(self.view_yaw), round(self.view_pitch))
+            cache = self.cache
+        if cache is not None:
+            surf.blit(cache, (r.x, r.y))
 
         if live:
             info = f"HDG {int(yaw) % 360:03d}°"
@@ -496,7 +613,11 @@ class Boat3D:
             text(surf, "lbl", "NO TELEMETRY — turntable view, drag to orbit",
                  r.x + 12, r.bottom - 24, DIM)
 
-    def _render(self, w, h, yaw, pitch, roll, alpha_bg=(16, 19, 26)):
+    def _render(self, w, h, yaw, pitch, roll, view_yaw=None, view_pitch=None):
+        if view_yaw is None:
+            view_yaw = self.view_yaw
+        if view_pitch is None:
+            view_pitch = self.view_pitch
         out = pygame.Surface((w, h), pygame.SRCALPHA)
 
         def rot(axis, deg):
@@ -508,7 +629,7 @@ class Boat3D:
             return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
         # model attitude (compass yaw is clockwise -> -yaw about Z), then view
-        R = rot("x", self.view_pitch) @ rot("z", self.view_yaw) \
+        R = rot("x", view_pitch) @ rot("z", view_yaw) \
             @ rot("z", -yaw) @ rot("x", pitch) @ rot("y", roll)
         v = self.verts @ R.T
         n = self.normals @ R.T
@@ -516,21 +637,37 @@ class Boat3D:
         px = w / 2 + v[:, 0] * s
         py = h / 2 + 6 - v[:, 2] * s
         depth = v[self.faces].mean(axis=1)[:, 1]
-        order = np.argsort(-depth)
         vis = n[:, 1] < 0
+        order = np.argsort(-depth)
+        vis_order = order[vis[order]]        # back-to-front, culled up front
         lightv = np.array([0.35, -0.55, 0.76])
-        lum = np.clip(0.35 + 0.65 * np.clip(-(n @ lightv), 0, 1), 0, 1)
+        lum = np.clip(-(n @ lightv), 0, 1)
+        cols = (26 + 22 * lum).astype(np.int32)
+
+        # Outline style: near-flat dark fill (only there to hide what's
+        # behind it), with silhouette + sharp-crease edges drawn on top.
+        a0 = np.where(self.eadj[:, 0] >= 0, self.eadj[:, 0], 0)
+        a1 = np.where(self.eadj[:, 1] >= 0, self.eadj[:, 1], self.eadj[:, 0])
+        edge_on = self.ecrease | (vis[a0] != vis[a1])
+        emask = edge_on[self.face_edges]     # (F,3): which edges to draw per face
+        eany = emask.any(axis=1)
+        EDGE_COL = (152, 178, 208)
         faces = self.faces
-        for fi in order:
-            if not vis[fi]:
-                continue
+        fedges = self.face_edges
+        edges = self.edges
+        for fi in vis_order:
             f = faces[fi]
-            c = lum[fi]
-            col = (int(70 + 110 * c), int(80 + 115 * c), int(95 + 125 * c))
-            pygame.draw.polygon(out, col,
+            c = cols[fi]
+            pygame.draw.polygon(out, (c, c + 4, c + 10),
                                 ((px[f[0]], py[f[0]]),
                                  (px[f[1]], py[f[1]]),
                                  (px[f[2]], py[f[2]])))
+            if eany[fi]:
+                for k in range(3):
+                    if emask[fi, k]:
+                        e0, e1 = edges[fedges[fi, k]]
+                        pygame.draw.line(out, EDGE_COL,
+                                         (px[e0], py[e0]), (px[e1], py[e1]))
         return out
 
 
@@ -567,7 +704,9 @@ def main():
 
     pygame.init()
     pygame.joystick.init()
-    screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
+    # default window = exact canvas size: skips the per-frame smoothscale
+    # (the biggest single main-thread cost) unless the user resizes
+    screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
     pygame.display.set_caption("BOAT DRIVER STATION")
     canvas = pygame.Surface((W, H))
     clock = pygame.time.Clock()
@@ -594,12 +733,13 @@ def main():
     w_cmd = 90
     left_cmd = right_cmd = 90
     prev_square = prev_l1 = prev_r1 = False
-    last_ack = 0.0
-    ack_count = 0
     disconnect_time = 0.0
     cam_decoded = None
     cam_last_decode = 0.0
     running = True
+
+    net = {"run": True, "cmd": (90, 90, 90, 0), "last_ack": 0.0, "ack_count": 0}
+    threading.Thread(target=_net_worker, args=(sock, net, nav), daemon=True).start()
 
     def to_canvas(pos):
         win_w, win_h = screen.get_size()
@@ -620,12 +760,12 @@ def main():
                 if e.key == pygame.K_F11:
                     fullscreen = not fullscreen
                     screen = pygame.display.set_mode(
-                        (0, 0) if fullscreen else (1280, 720),
+                        (0, 0) if fullscreen else (W, H),
                         pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE)
                 elif e.key == pygame.K_ESCAPE:
                     if fullscreen:
                         fullscreen = False
-                        screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
+                        screen = pygame.display.set_mode((W, H), pygame.RESIZABLE)
                     else:
                         running = False
                 elif e.key in (pygame.K_UP, pygame.K_RIGHT):
@@ -635,8 +775,10 @@ def main():
                 elif e.key == pygame.K_SPACE:
                     motors_on = not motors_on
                 elif e.key == pygame.K_c:
-                    mapview.waypoints.clear()
+                    mapview.clear_all()
                     mission_on = False
+                elif e.key == pygame.K_z and (e.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)):
+                    mapview.undo()
             elif e.type == pygame.MOUSEBUTTONDOWN:
                 cpos = to_canvas(e.pos)
                 if e.button in (4, 5):
@@ -648,14 +790,17 @@ def main():
                     if nav.has_fix and mapview.waypoints:
                         mission_on = not mission_on
                 elif btn_clear.collidepoint(cpos):
-                    mapview.waypoints.clear()
+                    mapview.clear_all()
                     mission_on = False
                 else:
-                    mapview.click(cpos, e.button)
+                    mapview.mouse_down(cpos, e.button)
             elif e.type == pygame.MOUSEBUTTONUP:
                 boat3d.mouse_up()
+                mapview.mouse_up()
             elif e.type == pygame.MOUSEMOTION:
-                boat3d.mouse_move(to_canvas(e.pos))
+                cpos = to_canvas(e.pos)
+                boat3d.mouse_move(cpos)
+                mapview.mouse_move(cpos)
             elif e.type == pygame.MOUSEWHEEL:
                 cpos = to_canvas(pygame.mouse.get_pos())
                 if mapview.rect.collidepoint(cpos):
@@ -727,22 +872,10 @@ def main():
                 w_cmd = 90
                 winch_cmd = 90
 
-        # E:0 tells the boat to hard-stop instantly (no ramp-down)
-        en = 1 if motors_on else 0
-        try:
-            sock.sendto(f"L:{left_cmd},R:{right_cmd},W:{w_cmd},E:{en}".encode(),
-                        (ESP32_IP, ESP32_PORT))
-        except OSError:
-            pass
-        try:
-            while True:
-                data, _ = sock.recvfrom(160)
-                if data:
-                    last_ack = time.time()
-                    ack_count += 1
-                    parse_ack(data, nav)
-        except OSError:
-            pass
+        # hand the command to the 50Hz network thread (E:0 = instant stop)
+        net["cmd"] = (left_cmd, right_cmd, w_cmd, 1 if motors_on else 0)
+        last_ack = net["last_ack"]
+        ack_count = net["ack_count"]
         boat_ok = (time.time() - last_ack) < 1.0
 
         # decode at most ~15 camera frames/sec
@@ -856,7 +989,8 @@ def main():
 
         text(canvas, "sm",
              "L1/R1|Arrows speed   SQUARE|SPACE arm   TRI/O/X winch   "
-             "click map = waypoint   drag 3D = orbit   F11 fullscreen",
+             "map: click add / drag move / r-click delete / Ctrl+Z undo   "
+             "drag 3D = orbit   F11 fullscreen",
              24, H - 26, GREY)
 
         # ---- letterbox scale to window ----
@@ -872,6 +1006,8 @@ def main():
         pygame.display.flip()
         clock.tick(SEND_HZ)
 
+    net["run"] = False
+    time.sleep(0.05)
     try:
         sock.sendto(b"L:90,R:90,W:90,E:0", (ESP32_IP, ESP32_PORT))
     except OSError:
