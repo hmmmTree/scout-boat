@@ -106,8 +106,11 @@ def main():
     ap.add_argument("--no-overview", action="store_true")
     a = ap.parse_args()
 
-    if a.zmax > 16:
-        sys.exit("zmax > 16 refused - that is a huge number of tiles.")
+    if a.zmax > 17:
+        sys.exit("zmax > 17 refused - that is a huge number of tiles.")
+    if a.zmax >= 16 and a.radius > 0.1:
+        print(f"note: z{a.zmax} at radius {a.radius} is a lot of tiles; "
+              "consider --radius 0.06 or smaller for deep zooms")
 
     total = 0
     if not a.no_overview:

@@ -571,7 +571,7 @@ class MapView:
                             cy + (py - self.rect.centery), self.z)
 
     def zoom_at(self, pos, direction):
-        nz = clamp(self.z + (1 if direction > 0 else -1), 3, 17)
+        nz = clamp(self.z + (1 if direction > 0 else -1), 3, 19)
         if nz == self.z:
             return
         anchor = self.screen_to_ll(*pos)      # keep this point under cursor
@@ -881,12 +881,19 @@ class MapView:
                 text(surf, "lbl", f"route {total:.0f}m",
                      r.x + 12, r.y + 40 + 20 * rows + 14, GREY)
 
-        # HUD line: zoom + scale + follow state + attribution
+        # HUD line: zoom + scale + follow state + cursor coords + attribution
         mpp = 40075016.7 * math.cos(math.radians(self.lat)) / ((1 << self.z) * TILESIZE)
-        text(surf, "lbl",
-             f"z{self.z}  {mpp * 100:.0f}m/100px   "
-             f"{'FOLLOW' if self.follow else 'free pan (F=follow)'}",
-             r.left + 10, r.bottom - 20, GREY)
+        scale_txt = (f"{mpp * 100:.0f}m/100px" if mpp * 100 >= 10
+                     else f"{mpp * 100:.1f}m/100px")
+        hud = (f"z{self.z}  {scale_txt}   "
+               f"{'FOLLOW' if self.follow else 'free pan (F=follow)'}")
+        if self._last is not None and self.rect.collidepoint(self._last):
+            clat, clon = self.screen_to_ll(*self._last)
+            hud += f"   cursor {clat:.6f}, {clon:.6f}"
+        if edit and self.sel is not None and self.sel < len(self.waypoints):
+            sw = self.waypoints[self.sel]
+            hud += f"   WP{self.sel+1} {sw['lat']:.6f}, {sw['lon']:.6f}"
+        text(surf, "lbl", hud, r.left + 10, r.bottom - 20, GREY)
         text(surf, "lbl", "(c) OpenStreetMap", r.right - 118, r.bottom - 20, GREY)
         if not (nav.alive and nav.has_fix):
             text(surf, "lbl", "NO GPS — boat position unknown",
