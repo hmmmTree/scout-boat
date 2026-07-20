@@ -11,7 +11,7 @@ Keys / controls:
   EDIT MODE only: click = add/select waypoint, drag one = move it,
   right-click = delete, DEL = delete selected, [ / ] = hold time -/+5s,
   Ctrl+Z = undo, C = clear all.  Purple pin = this computer (IP location).
-  3D view: drag to orbit
+  3D view: fixed camera — moves only with the boat's real attitude
 
 Network protocol (UDP to 192.168.4.1:4210):
   send: "L:<0-180>,R:<0-180>,W:<0-180>,E:<0|1>"     50x per second
@@ -1007,8 +1007,8 @@ class Boat3D:
     """Software-rendered 3D view of the Twin v2 CAD mesh.
 
     Yaw follows the boat's heading; pitch/roll follow the IMU when present.
-    Drag inside the panel to orbit the view. Without telemetry the model
-    idles on a slow turntable so orientation is still inspectable.
+    Fixed zeroed camera: the model moves only with the boat's real
+    attitude, and rests facing north when there is no telemetry.
     """
 
     def __init__(self, rect):
@@ -1032,13 +1032,10 @@ class Boat3D:
                 self.face_edges = inv.reshape(-1, 3)
                 self.ok = True
                 break
-        self.view_yaw = 0.0        # user orbit offset
-        self.view_pitch = 26.0
-        self.dragging = False
-        self.last_mouse = (0, 0)
-        self.idle = 0.0
-        # rendering happens on a worker thread (a full render takes ~30ms,
-        # which would drag the 50Hz control loop down to ~15Hz otherwise)
+        # fixed camera: no user orbit — the model always renders from the
+        # same zeroed view and only real attitude (heading/pitch/roll)
+        # moves it. Rendering happens on a worker thread (a full render
+        # takes ~30ms, which would drag the control loop down otherwise).
         self.cache = None
         self._want = None
         self._done = None
@@ -1063,24 +1060,6 @@ class Boat3D:
             # for the control loop
             time.sleep(max(0.02, 0.15 - (time.perf_counter() - t0)))
 
-    def mouse_down(self, pos):
-        if self.rect.collidepoint(pos):
-            self.dragging = True
-            self.last_mouse = pos
-            return True
-        return False
-
-    def mouse_up(self):
-        self.dragging = False
-
-    def mouse_move(self, pos):
-        if self.dragging:
-            dx = pos[0] - self.last_mouse[0]
-            dy = pos[1] - self.last_mouse[1]
-            self.view_yaw = (self.view_yaw + dx * 0.6) % 360
-            self.view_pitch = clamp(self.view_pitch + dy * 0.4, 5, 80)
-            self.last_mouse = pos
-
     def draw(self, surf, nav, dt):
         r = self.rect
         panel(surf, r.x, r.y, r.w, r.h, (16, 19, 26))
@@ -1095,12 +1074,10 @@ class Boat3D:
             pitch = nav.pitch or 0.0
             roll = nav.roll or 0.0
         else:
-            self.idle = (self.idle + dt * 12.0) % 360
-            yaw, pitch, roll = self.idle, 0.0, 0.0
+            yaw, pitch, roll = 0.0, 0.0, 0.0    # at rest, facing north
 
         with self._lock:
-            self._want = (r.w, r.h, round(yaw), round(pitch), round(roll),
-                          round(self.view_yaw), round(self.view_pitch))
+            self._want = (r.w, r.h, round(yaw), round(pitch), round(roll))
             cache = self.cache
         if cache is not None:
             surf.blit(cache, (r.x, r.y))
@@ -1111,14 +1088,10 @@ class Boat3D:
                 info += f"   P {nav.pitch:+.0f}°  R {nav.roll:+.0f}°"
             text(surf, "med", info, r.x + 12, r.bottom - 26, CYAN)
         else:
-            text(surf, "lbl", "NO TELEMETRY — turntable view, drag to orbit",
+            text(surf, "lbl", "NO TELEMETRY — model at rest",
                  r.x + 12, r.bottom - 24, DIM)
 
-    def _render(self, w, h, yaw, pitch, roll, view_yaw=None, view_pitch=None):
-        if view_yaw is None:
-            view_yaw = self.view_yaw
-        if view_pitch is None:
-            view_pitch = self.view_pitch
+    def _render(self, w, h, yaw, pitch, roll):
         out = pygame.Surface((w, h), pygame.SRCALPHA)
 
         def rot(axis, deg):
@@ -1129,9 +1102,9 @@ class Boat3D:
                 return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
             return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
-        # model attitude (compass yaw is clockwise -> -yaw about Z), then view
-        R = rot("x", view_pitch) @ rot("z", view_yaw) \
-            @ rot("z", -yaw) @ rot("x", pitch) @ rot("y", roll)
+        # model attitude only (compass yaw is clockwise -> -yaw about Z);
+        # the camera itself is fixed at zero — no view rotation at all
+        R = rot("z", -yaw) @ rot("x", pitch) @ rot("y", roll)
         v = self.verts @ R.T
         n = self.normals @ R.T
         s = min(w, h) * 0.62
@@ -1399,8 +1372,6 @@ def main():
                 elif e.button in (4, 5):
                     if mapview.rect.collidepoint(cpos):
                         mapview.zoom_at(cpos, 1 if e.button == 4 else -1)
-                elif e.button == 1 and not edit_mode and boat3d.mouse_down(cpos):
-                    pass
                 elif e.button == 1 and next(
                         (True for r, _ in w_btns if r.collidepoint(cpos)), False):
                     winch_cmd = next(c for r, c in w_btns if r.collidepoint(cpos))
@@ -1412,13 +1383,9 @@ def main():
                 else:
                     mapview.mouse_down(cpos, e.button, edit_mode)
             elif e.type == pygame.MOUSEBUTTONUP:
-                boat3d.mouse_up()
                 mapview.mouse_up(to_canvas(e.pos), edit_mode)
             elif e.type == pygame.MOUSEMOTION:
-                cpos = to_canvas(e.pos)
-                if not edit_mode:
-                    boat3d.mouse_move(cpos)
-                mapview.mouse_move(cpos)
+                mapview.mouse_move(to_canvas(e.pos))
             elif e.type == pygame.MOUSEWHEEL:
                 cpos = to_canvas(pygame.mouse.get_pos())
                 if help_open:
@@ -1659,6 +1626,16 @@ def main():
         if mode == "AUTO":
             text(canvas, "med", "AUTO", mapview.rect.right - 46,
                  mapview.rect.top + 20, ORANGE, center=True)
+        if edit_mode:
+            # live heading stays visible while planning
+            hdg_live = (nav.heading
+                        if (nav.alive and nav.heading is not None) else None)
+            cr = mapview.rect
+            compass(canvas, cr.right - 112, cr.top + 8, 104, hdg_live, wp_bear)
+            text(canvas, "med",
+                 f"{int(hdg_live) % 360:03d}°" if hdg_live is not None else "--",
+                 cr.right - 60, cr.top + 124,
+                 CYAN if hdg_live is not None else DIM, center=True)
 
         # mission bar: under the map normally, full width in edit mode
         if edit_mode:
